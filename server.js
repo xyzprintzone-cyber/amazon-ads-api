@@ -132,16 +132,23 @@ function getCachedReport(cacheKey) {
 }
 
 // ── Aggregation ───────────────────────────────────────────────────────────────
+// Helper: normalize spend field (API uses 'spend' for campaigns, 'cost' for keywords)
+function normSpend(r) { return r.spend || r.cost || 0; }
+// Helper: normalize sales (API uses sales14d or sales7d)
+function normSales(r)  { return r.sales14d || r.sales7d || r.attributedSales14d || 0; }
+// Helper: normalize orders (API uses purchases14d)
+function normOrders(r) { return r.purchases14d || r.purchases7d || r.orders || r.attributedConversions14d || 0; }
+
 function aggregateReportByCampaign(rows) {
   const map = {};
   for (const r of rows) {
     const k = r.campaignId || r.campaignName;
     if (!map[k]) map[k] = { campaignId: r.campaignId, campaignName: r.campaignName, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
-    map[k].spend       += r.spend       || 0;
+    map[k].spend       += normSpend(r);
     map[k].clicks      += r.clicks      || 0;
     map[k].impressions += r.impressions || 0;
-    map[k].orders      += r.orders      || 0;
-    map[k].sales       += r.sales7d     || r.attributedSales14d || 0;
+    map[k].orders      += normOrders(r);
+    map[k].sales       += normSales(r);
   }
   return Object.values(map).map(c => ({
     ...c,
@@ -157,16 +164,22 @@ function aggregateReportByKeyword(rows) {
   for (const r of rows) {
     const k = r.keywordId || `${r.keywordText}-${r.matchType}`;
     if (!map[k]) map[k] = {
-      keywordId: r.keywordId, keywordText: r.keywordText, matchType: r.matchType,
-      campaignId: r.campaignId, campaignName: r.campaignName,
-      adGroupId: r.adGroupId, bid: r.bid || 0,
+      keywordId:   r.keywordId,
+      keywordText: r.keywordText || r.keyword,
+      matchType:   r.matchType,
+      campaignId:  r.campaignId,
+      campaignName:r.campaignName,
+      adGroupId:   r.adGroupId,
+      adGroupName: r.adGroupName,
+      state:       r.adKeywordStatus,
+      bid:         r.keywordBid || 0,
       spend:0, clicks:0, impressions:0, orders:0, sales:0,
     };
-    map[k].spend       += r.spend       || 0;
+    map[k].spend       += normSpend(r);
     map[k].clicks      += r.clicks      || 0;
     map[k].impressions += r.impressions || 0;
-    map[k].orders      += r.orders      || r.attributedConversions14d || 0;
-    map[k].sales       += r.sales7d     || r.attributedSales14d || 0;
+    map[k].orders      += normOrders(r);
+    map[k].sales       += normSales(r);
   }
   return Object.values(map).map(k => ({
     ...k,
@@ -182,22 +195,22 @@ function aggregateReportByDate(rows) {
   for (const r of rows) {
     const d = r.date || "unknown";
     if (!map[d]) map[d] = { date: d, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
-    map[d].spend       += r.spend       || 0;
+    map[d].spend       += normSpend(r);
     map[d].clicks      += r.clicks      || 0;
     map[d].impressions += r.impressions || 0;
-    map[d].orders      += r.orders      || 0;
-    map[d].sales       += r.sales7d     || r.attributedSales14d || 0;
+    map[d].orders      += normOrders(r);
+    map[d].sales       += normSales(r);
   }
   return Object.values(map).sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function calcMetrics(rows) {
   const totals = rows.reduce((acc, r) => ({
-    spend:       acc.spend       + (r.spend || 0),
+    spend:       acc.spend       + normSpend(r),
     clicks:      acc.clicks      + (r.clicks || 0),
     impressions: acc.impressions + (r.impressions || 0),
-    orders:      acc.orders      + (r.orders || 0),
-    sales:       acc.sales       + (r.sales || 0),
+    orders:      acc.orders      + normOrders(r),
+    sales:       acc.sales       + normSales(r),
   }), { spend:0, clicks:0, impressions:0, orders:0, sales:0 });
 
   return {
@@ -492,16 +505,16 @@ const server = createServer(async (req, res) => {
         return json(res, { status: cached.status, data: [], message: "Report in elaborazione..." });
       }
 
-      // Group by query
+      // Group by search term
       const map = {};
       for (const r of cached.data) {
-        const q = r.query || r.keywordText;
-        if (!map[q]) map[q] = { query: q, campaignName: r.campaignName, matchType: r.matchType, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
-        map[q].spend       += r.spend       || 0;
+        const q = r.searchTerm || r.query || r.keyword || r.keywordText || "unknown";
+        if (!map[q]) map[q] = { query: q, campaignName: r.campaignName, campaignId: r.campaignId, matchType: r.matchType, targeting: r.targeting, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
+        map[q].spend       += normSpend(r);
         map[q].clicks      += r.clicks      || 0;
         map[q].impressions += r.impressions || 0;
-        map[q].orders      += r.orders      || r.attributedConversions14d || 0;
-        map[q].sales       += r.sales7d     || r.attributedSales14d       || 0;
+        map[q].orders      += normOrders(r);
+        map[q].sales       += normSales(r);
       }
       const terms = Object.values(map).map(t => ({
         ...t,

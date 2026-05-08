@@ -177,12 +177,15 @@ export async function pollReport(reportId, maxWaitMs = 600000) {
 }
 
 // ── Performance via report (all blocking — only call from background jobs) ───
+// Column names confirmed via live API testing May 2026
+
 export async function getCampaignPerformance(startDate, endDate) {
   const { data } = await requestReport(
-    "spCampaign",
+    "spCampaigns",    // confirmed working
     startDate,
     endDate,
-    ["date","campaignId","campaignName","campaignStatus","spend","clicks","impressions","orders","sales7d","attributedSales14d"],
+    ["date","campaignId","campaignName","campaignStatus","campaignBudgetAmount","campaignBudgetType",
+     "spend","clicks","impressions","purchases14d","sales14d","purchases7d","sales7d"],
     ["campaign"]
   );
   if (!data.reportId) throw new Error("Report req failed: " + JSON.stringify(data));
@@ -191,11 +194,13 @@ export async function getCampaignPerformance(startDate, endDate) {
 
 export async function getKeywordPerformance(startDate, endDate) {
   const { data } = await requestReport(
-    "spKeyword",
+    "spKeywords",     // confirmed working, groupBy adGroup
     startDate,
     endDate,
-    ["date","campaignId","campaignName","adGroupId","keywordId","keywordText","matchType","bid","spend","clicks","impressions","orders","sales7d","attributedSales14d","attributedConversions14d"],
-    ["keyword"]
+    ["date","campaignId","campaignName","adGroupId","adGroupName",
+     "keywordId","keywordText","matchType","keywordBid","adKeywordStatus",
+     "cost","clicks","impressions","purchases14d","sales14d","purchases7d","sales7d"],
+    ["adGroup"]       // NOTE: keyword groupBy not supported — use adGroup
   );
   if (!data.reportId) throw new Error("Report req failed: " + JSON.stringify(data));
   return pollReport(data.reportId);
@@ -203,10 +208,12 @@ export async function getKeywordPerformance(startDate, endDate) {
 
 export async function getSearchTermPerformance(startDate, endDate) {
   const { data } = await requestReport(
-    "spSearchTerm",
+    "spSearchTerm",   // confirmed working
     startDate,
     endDate,
-    ["date","campaignId","campaignName","adGroupId","keywordId","keywordText","query","matchType","spend","clicks","impressions","orders","sales7d","attributedSales14d","attributedConversions14d"],
+    ["date","campaignId","campaignName","adGroupId","adGroupName",
+     "keywordId","keyword","searchTerm","matchType","targeting",
+     "spend","clicks","impressions","purchases14d","sales14d","purchases7d","sales7d"],
     ["searchTerm"]
   );
   if (!data.reportId) throw new Error("Report req failed: " + JSON.stringify(data));
