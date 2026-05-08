@@ -6,6 +6,15 @@ const PORT = process.env.PORT || 8787;
 const ACOS_TARGET = parseFloat(process.env.ACOS_TARGET || "0.40");
 const DAILY_BUDGET_MAX = parseFloat(process.env.DAILY_BUDGET_MAX || "30.00");
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+function daysAgoStr(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
 
 function json(res, data, status = 200) {
   res.writeHead(status, {
@@ -27,11 +36,7 @@ async function readBody(req) {
   });
 }
 
-// ── Date helpers ──────────────────────────────────────────────────────────────
-function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-
+// ── Date-range aggregation ────────────────────────────────────────────────────
 function aggregateCampaignStats(campaign, startDate, endDate) {
   const stats = campaign.dailyStats || [];
   const filtered = stats.filter(s => s.date >= startDate && s.date <= endDate);
@@ -48,8 +53,8 @@ function aggregateCampaignStats(campaign, startDate, endDate) {
   );
 
   const acos = agg.sales > 0 ? agg.cost / agg.sales : null;
-  const ctr = agg.impressions > 0 ? agg.clicks / agg.impressions : 0;
-  const cpc = agg.clicks > 0 ? agg.cost / agg.clicks : 0;
+  const ctr  = agg.impressions > 0 ? agg.clicks / agg.impressions : 0;
+  const cpc  = agg.clicks > 0 ? agg.cost / agg.clicks : 0;
   const roas = agg.cost > 0 ? agg.sales / agg.cost : null;
 
   return {
@@ -70,44 +75,40 @@ function aggregateCampaignStats(campaign, startDate, endDate) {
   };
 }
 
-// ── AI Recommendations Engine ─────────────────────────────────────────────────
+// ── AI Engine ─────────────────────────────────────────────────────────────────
 function generateAIRecommendations(startDate, endDate) {
   const recs = [];
-
-  // Aggrega dati campagne per il periodo selezionato
   const campaignStats = mockCampaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
 
-  // 1. Keywords con ACoS > target e abbastanza click
+  // 1. Keyword ACoS > target AND clicks ≥ 5
   for (const kw of mockKeywords) {
     if (kw.state !== "enabled") continue;
     const acos = kw.attributedSales14d > 0
-      ? (kw.cost / kw.attributedSales14d)
+      ? kw.cost / kw.attributedSales14d
       : (kw.clicks >= 5 ? 999 : null);
+    if (acos === null || acos <= ACOS_TARGET) continue;
 
-    if (acos !== null && acos > ACOS_TARGET && kw.clicks >= 5) {
-      const currentBid = kw.bid;
-      const suggestedBid = acos < 999
-        ? Math.max(0.10, parseFloat((currentBid * (ACOS_TARGET / acos)).toFixed(2)))
-        : parseFloat((currentBid * 0.70).toFixed(2));
+    const suggestedBid = acos < 999
+      ? Math.max(0.10, parseFloat((kw.bid * (ACOS_TARGET / acos)).toFixed(2)))
+      : parseFloat((kw.bid * 0.70).toFixed(2));
 
-      recs.push({
-        id: `bid-reduce-${kw.keywordId}`,
-        type: "bid_reduce",
-        priority: acos > 1.0 ? "high" : "medium",
-        title: `Riduci offerta: "${kw.keywordText}"`,
-        description: `ACoS ${acos === 999 ? "∞" : (acos * 100).toFixed(0)}% (target ${(ACOS_TARGET * 100).toFixed(0)}%) · ${kw.clicks} click, nessuna conversione recente.`,
-        action: `Riduci da €${currentBid.toFixed(2)} → €${suggestedBid.toFixed(2)}`,
-        expectedImpact: acos < 999
-          ? `ACoS stimato: ~${(ACOS_TARGET * 100).toFixed(0)}%`
-          : `Risparmio: ~€${((currentBid - suggestedBid) * kw.clicks / 30).toFixed(2)}/gg`,
-        data: { keywordId: kw.keywordId, keywordText: kw.keywordText, currentBid, suggestedBid, acos },
-        timestamp: new Date().toISOString(),
-      });
-    }
+    recs.push({
+      id: `bid-reduce-${kw.keywordId}`,
+      type: "bid_reduce",
+      priority: acos > 1.0 ? "high" : "medium",
+      title: `Riduci offerta: "${kw.keywordText}"`,
+      description: `ACoS ${acos === 999 ? "∞" : (acos * 100).toFixed(0)}% (target ${(ACOS_TARGET * 100).toFixed(0)}%) · ${kw.clicks} click senza conversioni sufficienti`,
+      action: `Riduci offerta da €${kw.bid.toFixed(2)} → €${suggestedBid.toFixed(2)}`,
+      expectedImpact: acos < 999
+        ? `ACoS stimato ~${(ACOS_TARGET * 100).toFixed(0)}%`
+        : `Risparmio ~€${((kw.bid - suggestedBid) * kw.clicks / 30).toFixed(2)}/gg`,
+      data: { keywordId: kw.keywordId, keywordText: kw.keywordText, currentBid: kw.bid, suggestedBid, acos },
+      timestamp: new Date().toISOString(),
+    });
   }
 
-  // 2. Search terms con click ≥ 5 e 0 conversioni → negativa
-  const existingKeywordTexts = new Set(mockKeywords.map(k => k.keywordText.toLowerCase()));
+  // 2. Search term clicks ≥ 5 + 0 conversioni → negativa
+  const existingKwTexts = new Set(mockKeywords.map(k => k.keywordText.toLowerCase()));
   for (const st of mockSearchTerms) {
     if (st.clicks >= 5 && st.attributedConversions14d === 0) {
       recs.push({
@@ -116,53 +117,49 @@ function generateAIRecommendations(startDate, endDate) {
         priority: st.clicks >= 20 ? "high" : "medium",
         title: `Keyword negativa: "${st.query}"`,
         description: `${st.clicks} click · €${st.cost.toFixed(2)} spesi · 0 conversioni in "${st.campaignName}"`,
-        action: `Aggiungi "${st.query}" come negativa (exact)`,
-        expectedImpact: `Risparmio stimato: ~€${(st.cost * 0.8).toFixed(2)} nel periodo`,
+        action: `Aggiungi "${st.query}" come negativa (exact match)`,
+        expectedImpact: `Risparmio ~€${(st.cost * 0.8).toFixed(2)} nel periodo`,
         data: { query: st.query, campaignName: st.campaignName, clicks: st.clicks, cost: st.cost },
         timestamp: new Date().toISOString(),
       });
     }
   }
 
-  // 3. Search term ad alta conversione non in keyword → aggiungi
+  // 3. Search term con ≥2 conversioni non in keyword → aggiungi
   for (const st of mockSearchTerms) {
-    const alreadyKeyword = existingKeywordTexts.has(st.query.toLowerCase());
-    if (!alreadyKeyword && st.attributedConversions14d >= 2) {
-      const cvr = st.clicks > 0 ? st.attributedConversions14d / st.clicks : 0;
-      const suggestedBid = st.clicks > 0
-        ? parseFloat((st.cost / st.clicks * 1.1).toFixed(2))
-        : 0.50;
-
-      recs.push({
-        id: `add-keyword-${st.query.replace(/\s+/g, "-")}`,
-        type: "add_keyword",
-        priority: st.attributedConversions14d >= 3 ? "high" : "medium",
-        title: `Aggiungi keyword: "${st.query}"`,
-        description: `${st.attributedConversions14d} conversioni · CVR ${(cvr * 100).toFixed(0)}% · non in keyword manuali`,
-        action: `Aggiungi come exact match · offerta consigliata €${suggestedBid.toFixed(2)}`,
-        expectedImpact: `ACoS stimato: ${st.attributedSales14d > 0 ? ((st.cost / st.attributedSales14d) * 100).toFixed(0) : "n/d"}%`,
-        data: { query: st.query, campaignName: st.campaignName, conversions: st.attributedConversions14d, suggestedBid },
-        timestamp: new Date().toISOString(),
-      });
-    }
+    if (existingKwTexts.has(st.query.toLowerCase())) continue;
+    if (st.attributedConversions14d < 2) continue;
+    const cvr = st.clicks > 0 ? st.attributedConversions14d / st.clicks : 0;
+    const suggestedBid = st.clicks > 0
+      ? parseFloat((st.cost / st.clicks * 1.1).toFixed(2))
+      : 0.50;
+    recs.push({
+      id: `add-keyword-${st.query.replace(/\s+/g, "-")}`,
+      type: "add_keyword",
+      priority: st.attributedConversions14d >= 3 ? "high" : "medium",
+      title: `Aggiungi keyword: "${st.query}"`,
+      description: `${st.attributedConversions14d} conversioni · CVR ${(cvr * 100).toFixed(0)}% · non presente nelle keyword manuali`,
+      action: `Aggiungi come exact match · offerta consigliata €${suggestedBid.toFixed(2)}`,
+      expectedImpact: `ACoS stimato ${st.attributedSales14d > 0 ? ((st.cost / st.attributedSales14d) * 100).toFixed(0) : "n/d"}%`,
+      data: { query: st.query, campaignName: st.campaignName, conversions: st.attributedConversions14d, suggestedBid },
+      timestamp: new Date().toISOString(),
+    });
   }
 
-  // 4. Budget sottoutilizzato + ACoS sotto target → alzare le offerte
+  // 4. Budget sottoutilizzato + ACoS ok → alza offerte
   for (const cs of campaignStats) {
     if (cs.state !== "enabled" || cs.cost === 0) continue;
-    const budgetEur = cs.dailyBudget / 100;
     const days = Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1);
-    const totalBudget = budgetEur * days;
+    const totalBudget = (cs.dailyBudget / 100) * days;
     const spendRatio = cs.cost / totalBudget;
-
     if (spendRatio < 0.5 && cs.acos !== null && cs.acos < ACOS_TARGET) {
       recs.push({
         id: `budget-underuse-${cs.campaignId}`,
         type: "bid_increase",
         priority: "low",
         title: `Budget sottoutilizzato: "${cs.name}"`,
-        description: `Usa solo ${(spendRatio * 100).toFixed(0)}% del budget · €${cs.cost.toFixed(2)}/€${totalBudget.toFixed(2)} · ACoS ${cs.acos !== null ? (cs.acos * 100).toFixed(0) : "n/d"}%`,
-        action: `Aumenta le offerte del 15-20% sulle keyword top`,
+        description: `Solo ${(spendRatio * 100).toFixed(0)}% del budget usato · €${cs.cost.toFixed(2)}/€${totalBudget.toFixed(2)} · ACoS ${(cs.acos * 100).toFixed(0)}%`,
+        action: `Aumenta le offerte del 15-20% sulle keyword top per sfruttare il budget`,
         expectedImpact: `+${Math.round(cs.orders * 0.2)} ordini stimati nel periodo`,
         data: { campaignId: cs.campaignId, spendRatio, currentAcos: cs.acos },
         timestamp: new Date().toISOString(),
@@ -179,17 +176,17 @@ function generateAIRecommendations(startDate, endDate) {
         type: "acos_alert",
         priority: cs.acos > 0.80 ? "high" : "medium",
         title: `ACoS elevato: "${cs.name}"`,
-        description: `ACoS ${(cs.acos * 100).toFixed(0)}% vs target ${(ACOS_TARGET * 100).toFixed(0)}% · Spesa €${cs.cost.toFixed(2)} · Vendite €${cs.sales.toFixed(2)}`,
+        description: `ACoS ${(cs.acos * 100).toFixed(0)}% vs target ${(ACOS_TARGET * 100).toFixed(0)}% · €${cs.cost.toFixed(2)} spesi · €${cs.sales.toFixed(2)} vendite`,
         action: `Rivedi le offerte e metti in pausa le keyword meno performanti`,
-        expectedImpact: `Riduzione ACoS a ~${(ACOS_TARGET * 100).toFixed(0)}% con le bid suggestion`,
+        expectedImpact: `Riduzione ACoS a ~${(ACOS_TARGET * 100).toFixed(0)}%`,
         data: { campaignId: cs.campaignId, acos: cs.acos, cost: cs.cost, sales: cs.sales },
         timestamp: new Date().toISOString(),
       });
     }
   }
 
-  const priorityOrder = { high: 0, medium: 1, low: 2 };
-  recs.sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]);
+  const order = { high: 0, medium: 1, low: 2 };
+  recs.sort((a, b) => order[a.priority] - order[b.priority]);
   return recs;
 }
 
@@ -209,21 +206,19 @@ const server = createServer(async (req, res) => {
   }
 
   try {
+    // Health
     if (path === "/api/health") {
       return json(res, { ok: true, ts: Date.now(), mock: process.env.USE_MOCK !== "false" });
     }
 
-    // ── Campaigns con date range ─────────────────────────────────────────────
+    // Campaigns
     if (path === "/api/campaigns" && req.method === "GET") {
       const stateFilter = url.searchParams.get("state");
-      const startDate = url.searchParams.get("startDate") || daysAgo_str(7);
-      const endDate   = url.searchParams.get("endDate")   || todayStr();
-
+      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
+      const endDate     = url.searchParams.get("endDate")   || todayStr();
       const result = await amazon.getCampaigns();
       let campaigns = result.data;
-      if (stateFilter) campaigns = campaigns.filter(c => c.state === stateFilter);
-
-      // Aggrega dati per il range richiesto
+      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
       const data = campaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
       return json(res, data, result.ok ? 200 : 500);
     }
@@ -234,85 +229,64 @@ const server = createServer(async (req, res) => {
       return json(res, result.data, result.ok ? 200 : 500);
     }
 
-    // ── Summary stats per il date range ─────────────────────────────────────
+    // Summary
     if (path === "/api/summary" && req.method === "GET") {
-      const startDate = url.searchParams.get("startDate") || daysAgo_str(7);
-      const endDate   = url.searchParams.get("endDate")   || todayStr();
+      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
+      const endDate     = url.searchParams.get("endDate")   || todayStr();
       const stateFilter = url.searchParams.get("state");
-
       let campaigns = mockCampaigns;
-      if (stateFilter) campaigns = campaigns.filter(c => c.state === stateFilter);
-
+      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
       const stats = campaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
-      const totals = stats.reduce(
-        (acc, s) => ({
-          cost: acc.cost + s.cost,
-          clicks: acc.clicks + s.clicks,
-          impressions: acc.impressions + s.impressions,
-          orders: acc.orders + s.orders,
-          sales: acc.sales + s.sales,
-        }),
+      const t = stats.reduce(
+        (acc, s) => ({ cost: acc.cost+s.cost, clicks: acc.clicks+s.clicks, impressions: acc.impressions+s.impressions, orders: acc.orders+s.orders, sales: acc.sales+s.sales }),
         { cost: 0, clicks: 0, impressions: 0, orders: 0, sales: 0 }
       );
-
-      const acos = totals.sales > 0 ? totals.cost / totals.sales : null;
-      const ctr  = totals.impressions > 0 ? totals.clicks / totals.impressions : 0;
-      const cpc  = totals.clicks > 0 ? totals.cost / totals.clicks : 0;
-      const roas = totals.cost > 0 ? totals.sales / totals.cost : null;
-
       return json(res, {
-        cost: parseFloat(totals.cost.toFixed(2)),
-        clicks: totals.clicks,
-        impressions: totals.impressions,
-        orders: totals.orders,
-        sales: parseFloat(totals.sales.toFixed(2)),
-        acos: acos !== null ? parseFloat(acos.toFixed(4)) : null,
-        ctr: parseFloat(ctr.toFixed(4)),
-        cpc: parseFloat(cpc.toFixed(2)),
-        roas: roas !== null ? parseFloat(roas.toFixed(2)) : null,
+        cost:         parseFloat(t.cost.toFixed(2)),
+        clicks:       t.clicks,
+        impressions:  t.impressions,
+        orders:       t.orders,
+        sales:        parseFloat(t.sales.toFixed(2)),
+        acos:         t.sales > 0 ? parseFloat((t.cost/t.sales).toFixed(4)) : null,
+        ctr:          t.impressions > 0 ? parseFloat((t.clicks/t.impressions).toFixed(4)) : 0,
+        cpc:          t.clicks > 0 ? parseFloat((t.cost/t.clicks).toFixed(2)) : 0,
+        roas:         t.cost > 0 ? parseFloat((t.sales/t.cost).toFixed(2)) : null,
         activeCampaigns: stats.filter(s => s.state === "enabled").length,
-        startDate,
-        endDate,
+        startDate, endDate,
       });
     }
 
-    // ── Daily chart data ────────────────────────────────────────────────────
+    // Chart
     if (path === "/api/chart" && req.method === "GET") {
-      const startDate = url.searchParams.get("startDate") || daysAgo_str(7);
-      const endDate   = url.searchParams.get("endDate")   || todayStr();
+      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
+      const endDate     = url.searchParams.get("endDate")   || todayStr();
       const stateFilter = url.searchParams.get("state");
-
       let campaigns = mockCampaigns;
-      if (stateFilter) campaigns = campaigns.filter(c => c.state === stateFilter);
-
-      // Aggrega per giorno su tutte le campagne
+      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
       const byDate = {};
       for (const camp of campaigns) {
         for (const s of (camp.dailyStats || [])) {
           if (s.date < startDate || s.date > endDate) continue;
           if (!byDate[s.date]) byDate[s.date] = { date: s.date, cost: 0, clicks: 0, impressions: 0, orders: 0, sales: 0 };
-          byDate[s.date].cost += s.cost;
-          byDate[s.date].clicks += s.clicks;
+          byDate[s.date].cost        += s.cost;
+          byDate[s.date].clicks      += s.clicks;
           byDate[s.date].impressions += s.impressions;
-          byDate[s.date].orders += s.orders;
-          byDate[s.date].sales += s.sales;
+          byDate[s.date].orders      += s.orders;
+          byDate[s.date].sales       += s.sales;
         }
       }
-
-      const rows = Object.values(byDate)
-        .sort((a, b) => a.date.localeCompare(b.date))
-        .map(r => ({
-          ...r,
-          cost: parseFloat(r.cost.toFixed(2)),
-          sales: parseFloat(r.sales.toFixed(2)),
-          acos: r.sales > 0 ? parseFloat((r.cost / r.sales).toFixed(4)) : null,
-        }));
-
+      const rows = Object.values(byDate).sort((a,b) => a.date.localeCompare(b.date)).map(r => ({
+        ...r,
+        cost:  parseFloat(r.cost.toFixed(2)),
+        sales: parseFloat(r.sales.toFixed(2)),
+        acos:  r.sales > 0 ? parseFloat((r.cost/r.sales).toFixed(4)) : null,
+      }));
       return json(res, rows);
     }
 
+    // Keywords
     if (path === "/api/keywords" && req.method === "GET") {
-      const campaignId = url.searchParams.get("campaignId");
+      const campaignId  = url.searchParams.get("campaignId");
       const stateFilter = url.searchParams.get("state");
       const result = await amazon.getKeywords(campaignId);
       let data = result.data;
@@ -361,14 +335,15 @@ const server = createServer(async (req, res) => {
       return json(res, data);
     }
 
-    // ── AI Recommendations ─────────────────────────────────────────────────
+    // AI Recommendations
     if (path === "/api/ai/recommendations" && req.method === "GET") {
-      const startDate = url.searchParams.get("startDate") || daysAgo_str(7);
+      const startDate = url.searchParams.get("startDate") || daysAgoStr(7);
       const endDate   = url.searchParams.get("endDate")   || todayStr();
       const recs = generateAIRecommendations(startDate, endDate);
       return json(res, { ok: true, count: recs.length, recommendations: recs, generatedAt: new Date().toISOString() });
     }
 
+    // AI Apply
     if (path === "/api/ai/apply" && req.method === "POST") {
       const body = await readBody(req);
       const { recommendationId, type, data: actionData } = body;
@@ -387,7 +362,6 @@ const server = createServer(async (req, res) => {
   }
 });
 
-
 server.listen(PORT, () => {
-  console.log(`API running on port ${PORT} | ACoS target: ${(ACOS_TARGET * 100).toFixed(0)}% | Budget max: €${DAILY_BUDGET_MAX}`);
+  console.log(`API ready on :${PORT} | ACoS target ${(ACOS_TARGET*100).toFixed(0)}% | Budget max €${DAILY_BUDGET_MAX}`);
 });
