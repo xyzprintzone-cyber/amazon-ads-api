@@ -179,14 +179,8 @@ export async function pollReport(reportId, maxWaitMs = 120_000) {
 }
 
 export async function downloadReport(url) {
-  const token = await getAccessToken();
-  const { CLIENT_ID } = cfg();
-  const res = await fetch(url, {
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Amazon-Advertising-API-ClientId": CLIENT_ID,
-    },
-  });
+  // S3 presigned URL — no auth headers needed (they break it)
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`downloadReport → ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   // Reports are gzip-compressed JSON
@@ -228,7 +222,7 @@ export async function fetchKeywordReport(startDate, endDate, maxWaitMs = 600_000
     configuration: {
       adProduct: "SPONSORED_PRODUCTS",
       groupBy: ["adGroup"],
-      columns: ["keywordId", "keywordText", "matchType", "impressions", "clicks", "cost", "attributedSales7d", "attributedConversions7d"],
+      columns: ["campaignId", "campaignName", "adGroupId", "adGroupName", "impressions", "clicks", "cost", "purchases7d", "sales7d"],
       reportTypeId: "spKeywords",
       timeUnit: "SUMMARY",
       format: "GZIP_JSON",

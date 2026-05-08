@@ -1,159 +1,121 @@
-// ai-engine.js — GPT-4o analizza le campagne e genera azioni concrete
+// ai-engine.js — Groq (llama-3.3-70b) optimizer
 import fetch from "node-fetch";
 
-// Lazy config — read after .env is loaded
-function cfg() {
-  return {
-    OPENAI_KEY:  process.env.OPENAI_API_KEY,
-    ACOS_TARGET: parseFloat(process.env.ACOS_TARGET  || "0.40"),
-    BUDGET_MAX:  parseFloat(process.env.DAILY_BUDGET_MAX || "30.00"),
-  };
-}
+const GROQ_API = "https://api.groq.com/openai/v1/chat/completions";
+const MODEL    = "llama-3.3-70b-versatile";
 
-function getSystemPrompt() {
-  const { ACOS_TARGET, BUDGET_MAX } = cfg();
-  return `Sei un esperto di Amazon Advertising con 10 anni di esperienza nell'ottimizzazione di campagne Sponsored Products per il marketplace IT.
+export async function analyzeAndGenerateActions(data, acosTarget = 0.40) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error("GROQ_API_KEY not set");
 
-Il tuo obiettivo è massimizzare le vendite mantenendo ACoS ≤ ${(ACOS_TARGET*100).toFixed(0)}% e budget totale ≤ €${BUDGET_MAX}/giorno.
+  const { campaigns = [], keywords = [], reportData = {} } = data;
 
-Regole di ottimizzazione:
-- BID: modifica massima ±30% per singolo aggiornamento. Minimo €0.10, massimo €2.00
-- PAUSA: solo keyword con ≥10 click e 0 conversioni negli ultimi 7 giorni
-- NEGATIVA: aggiungi search term con ≥8 click, 0 conversioni, spesa > €2
-- SCALA: aumenta bid del 10-20% su keyword con ACoS < 25% e ≥3 conversioni
-- BUDGET: non aumentare mai il budget totale oltre €${BUDGET_MAX}/gg
-- NON toccare campagne con meno di 5 giorni di dati
+  // Build compact summary for the prompt
+  const campSummary = campaigns.slice(0, 50).map(c => ({
+    id:     c.campaignId,
+    name:   c.name,
+    state:  c.state,
+    budget: c.budget?.budget,
+  }));
 
-Output SOLO JSON valido, nessun testo aggiuntivo. Formato:
-{
-  "summary": "stringa riassuntiva di cosa hai trovato e perché agisci così",
-  "actions": [
-    {
-      "type": "bid_change|pause_keyword|enable_keyword|add_negative|pause_campaign|budget_change",
-      "entityType": "keyword|campaign|search_term",
-      "entityId": "id numerico come stringa",
-      "entityName": "nome leggibile",
-      "campaignName": "nome campagna",
-      "oldValue": numero_attuale,
-      "newValue": nuovo_valore_proposto,
-      "reason": "spiegazione breve in italiano",
-      "expectedImpact": "es: ACoS stimato -15%, risparmio €2.40/gg"
+  const kwSummary = (keywords || []).slice(0, 100).map(k => ({
+    id:       k.keywordId,
+    text:     k.keywordText,
+    matchType: k.matchType,
+    bid:      k.bid,
+    state:    k.state,
+    campId:   k.campaignId,
+  }));
+
+  const perfMap = {};
+  if (reportData.campaigns) {
+    for (const r of reportData.campaigns) {
+      perfMap[r.campaignId] = {
+        impressions: r.impressions,
+        clicks:      r.clicks,
+        cost:        r.cost,
+        sales:       r.sales7d || r.attributedSales7d || 0,
+        acos:        r.cost && r.sales7d ? r.cost / r.sales7d : null,
+      };
     }
-  ]
-}`;
-}
+  }
+  if (reportData.keywords) {
+    for (const r of reportData.keywords) {
+      perfMap[`kw_${r.keywordId}`] = {
+        impressions: r.impressions,
+        clicks:      r.clicks,
+        cost:        r.cost,
+        sales:       r.attributedSales7d || r.sales7d || 0,
+        acos:        r.cost && (r.attributedSales7d || r.sales7d)
+                       ? r.cost / (r.attributedSales7d || r.sales7d) : null,
+      };
+    }
+  }
 
-export async function analyzeAndGenerateActions(data) {
-  const { campaigns, keywords, searchTerms } = data;
+  const prompt = `You are an Amazon Ads optimizer. ACoS target: ${(acosTarget * 100).toFixed(0)}%.
 
-  // Prepara contesto compatto per GPT
-  const context = buildContext(campaigns, keywords, searchTerms);
+CAMPAIGNS (${campSummary.length}):
+${JSON.stringify(campSummary, null, 1)}
 
-  const userMsg = `Analizza questi dati delle campagne Amazon Ads IT e genera le azioni di ottimizzazione necessarie.
+KEYWORDS (${kwSummary.length}):
+${JSON.stringify(kwSummary, null, 1)}
 
-DATI ATTUALI (ultimi 7 giorni):
-${JSON.stringify(context, null, 2)}
+PERFORMANCE (last 7 days):
+${JSON.stringify(perfMap, null, 1)}
 
-Genera le azioni concrete da eseguire adesso.`;
+Rules:
+- Bid changes max ±35%, min €0.10, max €2.00
+- Only act on keywords with enough data (>5 clicks or >100 impressions)
+- Pause keywords with 0 conversions and cost > 2x ACoS target
+- Increase bids when ACoS is well below target and CTR is good
+- Decrease bids when ACoS is above target
 
-  const { OPENAI_KEY } = cfg();
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+Respond with ONLY a JSON array of actions, no explanation:
+[
+  {"type":"update_bid","keywordId":"...","newBid":0.50,"reason":"..."},
+  {"type":"pause_keyword","keywordId":"...","reason":"..."},
+  {"type":"enable_keyword","keywordId":"...","reason":"..."},
+  {"type":"update_budget","campaignId":"...","newBudget":15.00,"reason":"..."},
+  {"type":"pause_campaign","campaignId":"...","reason":"..."}
+]
+
+If no actions needed, return [].`;
+
+  const res = await fetch(GROQ_API, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${OPENAI_KEY}`,
-      "Content-Type": "application/json",
+      "Authorization": `Bearer ${key}`,
+      "Content-Type":  "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o",
-      messages: [
-        { role: "system", content: getSystemPrompt() },
-        { role: "user", content: userMsg },
-      ],
+      model:       MODEL,
+      messages:    [{ role: "user", content: prompt }],
+      max_tokens:  4096,
       temperature: 0.2,
-      max_tokens: 2000,
-      response_format: { type: "json_object" },
     }),
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenAI error ${res.status}: ${err.slice(0, 200)}`);
+    const txt = await res.text();
+    throw new Error(`Groq error ${res.status}: ${txt}`);
   }
 
   const d = await res.json();
-  const content = d.choices?.[0]?.message?.content;
-  if (!content) throw new Error("OpenAI: risposta vuota");
+  const content = d.choices?.[0]?.message?.content || "[]";
 
-  const result = JSON.parse(content);
-  console.log(`[AI] Summary: ${result.summary}`);
-  console.log(`[AI] Azioni generate: ${result.actions?.length || 0}`);
+  // Extract JSON array from response
+  const match = content.match(/\[[\s\S]*\]/);
+  if (!match) {
+    console.warn("[AI] No JSON array in response:", content.slice(0, 200));
+    return [];
+  }
 
-  return result;
-}
-
-function buildContext(campaigns, keywords, searchTerms) {
-  // Campagne — top 20 per spesa
-  const campContext = campaigns.slice(0, 20).map(c => ({
-    id: String(c.campaignId || c.campaign_id || ""),
-    name: c.name || c.campaignName || "",
-    state: c.state,
-    budget: c.dailyBudget ? (c.dailyBudget / 100).toFixed(2) : c.daily_budget,
-    spend7d: c.cost?.toFixed(2) || "0",
-    sales7d: c.sales?.toFixed(2) || "0",
-    orders7d: c.orders || 0,
-    acos: c.acos ? (c.acos * 100).toFixed(1) + "%" : "n/d",
-    clicks7d: c.clicks || 0,
-    impressions7d: c.impressions || 0,
-    cpc: c.cpc?.toFixed(2) || "0",
-    roas: c.roas?.toFixed(2) || "0",
-  }));
-
-  // Keyword — top 50 per spesa
-  const kwContext = (keywords || []).slice(0, 50).map(k => {
-    const acos = (k.attributedSales14d || k.sales || 0) > 0
-      ? (k.cost || 0) / (k.attributedSales14d || k.sales)
-      : null;
-    return {
-      id: String(k.keywordId || k.keyword_id || ""),
-      text: k.keywordText || k.keyword_text || "",
-      match: k.matchType || k.match_type || "",
-      campaign: k.campaignName || k.campaign_name || "",
-      adGroup: k.adGroupName || k.ad_group_name || "",
-      state: k.state,
-      bid: k.bid?.toFixed(2) || "0",
-      clicks: k.clicks || 0,
-      spend: (k.cost || 0).toFixed(2),
-      orders: k.attributedConversions14d || k.orders || 0,
-      sales: (k.attributedSales14d || k.sales || 0).toFixed(2),
-      acos: acos !== null ? (acos * 100).toFixed(1) + "%" : "n/d",
-    };
-  });
-
-  // Search term — top 30 problematici (click alti, 0 conv)
-  const stContext = (searchTerms || [])
-    .filter(s => (s.clicks || 0) >= 3)
-    .sort((a, b) => (b.cost || 0) - (a.cost || 0))
-    .slice(0, 30)
-    .map(s => ({
-      query: s.query || s.keywordText || "",
-      campaign: s.campaignName || "",
-      adGroup: s.adGroupName || "",
-      clicks: s.clicks || 0,
-      spend: (s.cost || 0).toFixed(2),
-      orders: s.attributedConversions14d || 0,
-      sales: (s.attributedSales14d || 0).toFixed(2),
-    }));
-
-  return {
-    summary: {
-      totalSpend7d: campaigns.reduce((s, c) => s + (c.cost || 0), 0).toFixed(2),
-      totalSales7d: campaigns.reduce((s, c) => s + (c.sales || 0), 0).toFixed(2),
-      totalOrders7d: campaigns.reduce((s, c) => s + (c.orders || 0), 0),
-      acosTarget: (cfg().ACOS_TARGET * 100).toFixed(0) + "%",
-      dailyBudgetMax: "€" + cfg().BUDGET_MAX,
-    },
-    campaigns: campContext,
-    keywords: kwContext,
-    searchTerms: stContext,
-  };
+  try {
+    const actions = JSON.parse(match[0]);
+    console.log(`[AI] Groq generated ${actions.length} actions`);
+    return Array.isArray(actions) ? actions : [];
+  } catch (e) {
+    console.warn("[AI] JSON parse failed:", e.message);
+    return [];
+  }
 }
