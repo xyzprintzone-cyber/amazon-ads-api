@@ -1,6 +1,10 @@
 import { createServer } from "http";
 import * as amazon from "./amazon.js";
 import { mockCampaigns, mockKeywords, mockSearchTerms } from "./mock-data.js";
+import { parseAmazonCSV } from "./csv-parser.js";
+
+// ── CSV Data Store (in-memory, survives cold starts per sessione) ──────────────
+let csvStore = null; // { campaigns, keywords, searchTerms, dateRange, uploadedAt, rowCount }
 
 const PORT = process.env.PORT || 8787;
 const ACOS_TARGET = parseFloat(process.env.ACOS_TARGET || "0.40");
@@ -34,6 +38,25 @@ async function readBody(req) {
       try { resolve(JSON.parse(body)); } catch { resolve({}); }
     });
   });
+}
+
+async function readRawBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+// Restituisce campagne attive: CSV se caricato, altrimenti mock
+function activeCampaigns() {
+  return csvStore ? csvStore.campaigns : mockCampaigns;
+}
+function activeKeywords() {
+  return csvStore ? csvStore.keywords : mockKeywords;
+}
+function activeSearchTerms() {
+  return csvStore ? csvStore.searchTerms : mockSearchTerms;
 }
 
 // ── Date-range aggregation ────────────────────────────────────────────────────
@@ -78,10 +101,10 @@ function aggregateCampaignStats(campaign, startDate, endDate) {
 // ── AI Engine ─────────────────────────────────────────────────────────────────
 function generateAIRecommendations(startDate, endDate) {
   const recs = [];
-  const campaignStats = mockCampaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
+  const campaignStats = activeCampaigns().map(c => aggregateCampaignStats(c, startDate, endDate));
 
   // 1. Keyword ACoS > target AND clicks ≥ 5
-  for (const kw of mockKeywords) {
+  for (const kw of activeKeywords()) {
     if (kw.state !== "enabled") continue;
     const acos = kw.attributedSales14d > 0
       ? kw.cost / kw.attributedSales14d
@@ -108,8 +131,8 @@ function generateAIRecommendations(startDate, endDate) {
   }
 
   // 2. Search term clicks ≥ 5 + 0 conversioni → negativa
-  const existingKwTexts = new Set(mockKeywords.map(k => k.keywordText.toLowerCase()));
-  for (const st of mockSearchTerms) {
+  const existingKwTexts = new Set(activeKeywords().map(k => k.keywordText.toLowerCase()));
+  for (const st of activeSearchTerms()) {
     if (st.clicks >= 5 && st.attributedConversions14d === 0) {
       recs.push({
         id: `negative-${st.query.replace(/\s+/g, "-")}`,
@@ -126,7 +149,7 @@ function generateAIRecommendations(startDate, endDate) {
   }
 
   // 3. Search term con ≥2 conversioni non in keyword → aggiungi
-  for (const st of mockSearchTerms) {
+  for (const st of activeSearchTerms()) {
     if (existingKwTexts.has(st.query.toLowerCase())) continue;
     if (st.attributedConversions14d < 2) continue;
     const cvr = st.clicks > 0 ? st.attributedConversions14d / st.clicks : 0;
@@ -234,7 +257,7 @@ const server = createServer(async (req, res) => {
       const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
       const endDate     = url.searchParams.get("endDate")   || todayStr();
       const stateFilter = url.searchParams.get("state");
-      let campaigns = mockCampaigns;
+      let campaigns = activeCampaigns();
       if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
       const stats = campaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
       const t = stats.reduce(
@@ -261,7 +284,7 @@ const server = createServer(async (req, res) => {
       const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
       const endDate     = url.searchParams.get("endDate")   || todayStr();
       const stateFilter = url.searchParams.get("state");
-      let campaigns = mockCampaigns;
+      let campaigns = activeCampaigns();
       if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
       const byDate = {};
       for (const camp of campaigns) {
@@ -349,10 +372,95 @@ const server = createServer(async (req, res) => {
       const { recommendationId, type, data: actionData } = body;
       console.log(`[AI APPLY] ${type}: ${JSON.stringify(actionData)}`);
       if (type === "bid_reduce" && actionData?.keywordId) {
-        const kw = mockKeywords.find(k => k.keywordId === actionData.keywordId);
+        const kw = activeKeywords().find(k => k.keywordId === actionData.keywordId);
         if (kw) kw.bid = actionData.suggestedBid;
       }
       return json(res, { ok: true, applied: recommendationId, timestamp: new Date().toISOString() });
+    }
+
+    // ── CSV Upload ──────────────────────────────────────────────────────────────
+    // POST /api/csv/upload  — body: raw CSV text (Content-Type: text/plain o multipart)
+    if (path === "/api/csv/upload" && req.method === "POST") {
+      const contentType = req.headers["content-type"] || "";
+      let csvText = "";
+
+      if (contentType.includes("multipart/form-data")) {
+        // Estrai testo dal multipart (cerca il body dopo headers vuoti)
+        const raw = await readRawBody(req);
+        const boundary = contentType.split("boundary=")[1];
+        if (boundary) {
+          const parts = raw.split("--" + boundary);
+          for (const part of parts) {
+            if (part.includes("filename=") || part.includes('name="file"') || part.includes('name="csv"')) {
+              const bodyStart = part.indexOf("\r\n\r\n");
+              if (bodyStart !== -1) {
+                csvText = part.slice(bodyStart + 4).replace(/\r\n--$/, "").trim();
+                break;
+              }
+            }
+          }
+          // fallback: prendi qualsiasi parte con contenuto
+          if (!csvText) {
+            for (const part of parts) {
+              const bodyStart = part.indexOf("\r\n\r\n");
+              if (bodyStart !== -1) {
+                const candidate = part.slice(bodyStart + 4).replace(/\r\n--$/, "").trim();
+                if (candidate.length > 10) { csvText = candidate; break; }
+              }
+            }
+          }
+        }
+      } else {
+        // text/plain o application/octet-stream
+        csvText = await readRawBody(req);
+      }
+
+      if (!csvText || csvText.length < 10) {
+        return json(res, { ok: false, error: "CSV vuoto o non leggibile" }, 400);
+      }
+
+      const result = parseAmazonCSV(csvText);
+      if (!result.ok) {
+        return json(res, result, 400);
+      }
+
+      csvStore = result;
+      console.log(`[CSV UPLOAD] ${result.rowCount} righe · ${result.campaigns.length} campagne · ${result.type}`);
+
+      return json(res, {
+        ok: true,
+        message: `Importato: ${result.rowCount} righe, ${result.campaigns.length} campagne`,
+        type: result.type,
+        campaigns: result.campaigns.length,
+        keywords: result.keywords.length,
+        searchTerms: result.searchTerms.length,
+        dateRange: result.dateRange,
+        uploadedAt: result.uploadedAt,
+      });
+    }
+
+    // GET /api/csv/status — controlla se c'è un CSV caricato
+    if (path === "/api/csv/status" && req.method === "GET") {
+      if (!csvStore) {
+        return json(res, { hasData: false, source: "mock" });
+      }
+      return json(res, {
+        hasData: true,
+        source: "csv",
+        type: csvStore.type,
+        campaigns: csvStore.campaigns.length,
+        keywords: csvStore.keywords.length,
+        searchTerms: csvStore.searchTerms.length,
+        dateRange: csvStore.dateRange,
+        uploadedAt: csvStore.uploadedAt,
+        rowCount: csvStore.rowCount,
+      });
+    }
+
+    // DELETE /api/csv/clear — torna ai dati mock
+    if (path === "/api/csv/clear" && req.method === "DELETE") {
+      csvStore = null;
+      return json(res, { ok: true, message: "Dati CSV rimossi, tornato ai dati mock" });
     }
 
     json(res, { error: "Not found" }, 404);
