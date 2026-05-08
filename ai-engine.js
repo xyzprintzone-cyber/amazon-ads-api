@@ -1,285 +1,159 @@
-// ai-engine.js — GPT-4o ottimizzazione automatica Amazon Ads
-// Analizza dati reali, genera azioni, le applica automaticamente
+// ai-engine.js — GPT-4o analizza le campagne e genera azioni concrete
+import fetch from "node-fetch";
 
-const OPENAI_API = "https://api.openai.com/v1/chat/completions";
-const ACOS_TARGET = parseFloat(process.env.ACOS_TARGET || "0.40");
-const BUDGET_MAX = parseFloat(process.env.DAILY_BUDGET_MAX || "30.00");
+// Lazy config — read after .env is loaded
+function cfg() {
+  return {
+    OPENAI_KEY:  process.env.OPENAI_API_KEY,
+    ACOS_TARGET: parseFloat(process.env.ACOS_TARGET  || "0.40"),
+    BUDGET_MAX:  parseFloat(process.env.DAILY_BUDGET_MAX || "30.00"),
+  };
+}
 
-// ── Analisi AI con GPT-4o ─────────────────────────────────────────────────────
-export async function analyzeWithAI(campaigns, keywords, searchTerms, actionLog) {
-  const prompt = buildPrompt(campaigns, keywords, searchTerms, actionLog);
+function getSystemPrompt() {
+  const { ACOS_TARGET, BUDGET_MAX } = cfg();
+  return `Sei un esperto di Amazon Advertising con 10 anni di esperienza nell'ottimizzazione di campagne Sponsored Products per il marketplace IT.
 
-  const res = await fetch(OPENAI_API, {
+Il tuo obiettivo è massimizzare le vendite mantenendo ACoS ≤ ${(ACOS_TARGET*100).toFixed(0)}% e budget totale ≤ €${BUDGET_MAX}/giorno.
+
+Regole di ottimizzazione:
+- BID: modifica massima ±30% per singolo aggiornamento. Minimo €0.10, massimo €2.00
+- PAUSA: solo keyword con ≥10 click e 0 conversioni negli ultimi 7 giorni
+- NEGATIVA: aggiungi search term con ≥8 click, 0 conversioni, spesa > €2
+- SCALA: aumenta bid del 10-20% su keyword con ACoS < 25% e ≥3 conversioni
+- BUDGET: non aumentare mai il budget totale oltre €${BUDGET_MAX}/gg
+- NON toccare campagne con meno di 5 giorni di dati
+
+Output SOLO JSON valido, nessun testo aggiuntivo. Formato:
+{
+  "summary": "stringa riassuntiva di cosa hai trovato e perché agisci così",
+  "actions": [
+    {
+      "type": "bid_change|pause_keyword|enable_keyword|add_negative|pause_campaign|budget_change",
+      "entityType": "keyword|campaign|search_term",
+      "entityId": "id numerico come stringa",
+      "entityName": "nome leggibile",
+      "campaignName": "nome campagna",
+      "oldValue": numero_attuale,
+      "newValue": nuovo_valore_proposto,
+      "reason": "spiegazione breve in italiano",
+      "expectedImpact": "es: ACoS stimato -15%, risparmio €2.40/gg"
+    }
+  ]
+}`;
+}
+
+export async function analyzeAndGenerateActions(data) {
+  const { campaigns, keywords, searchTerms } = data;
+
+  // Prepara contesto compatto per GPT
+  const context = buildContext(campaigns, keywords, searchTerms);
+
+  const userMsg = `Analizza questi dati delle campagne Amazon Ads IT e genera le azioni di ottimizzazione necessarie.
+
+DATI ATTUALI (ultimi 7 giorni):
+${JSON.stringify(context, null, 2)}
+
+Genera le azioni concrete da eseguire adesso.`;
+
+  const { OPENAI_KEY } = cfg();
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Authorization": `Bearer ${OPENAI_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: "gpt-4o",
-      temperature: 0.2,
-      response_format: { type: "json_object" },
       messages: [
-        {
-          role: "system",
-          content: `Sei un esperto di Amazon Ads per un venditore italiano (XYZ Print Zone) che vende prodotti stampati personalizzati (scritte 3D, portachiavi, targhe). 
-Analizza i dati delle campagne e restituisci SOLO un JSON con le azioni di ottimizzazione da eseguire.
-Target ACoS: ${(ACOS_TARGET * 100).toFixed(0)}%. Budget max giornaliero totale: €${BUDGET_MAX}.
-Sii aggressivo nell'ottimizzazione — ogni euro speso deve generare profitto.
-Restituisci JSON con questo schema esatto:
-{
-  "summary": "stringa breve con stato generale delle campagne",
-  "overallHealth": "good|warning|critical",
-  "actions": [
-    {
-      "id": "unique-id",
-      "type": "bid_reduce|bid_increase|pause_keyword|add_negative|add_keyword|pause_campaign|adjust_budget",
-      "priority": "critical|high|medium|low",
-      "auto": true/false,  // true = esegui automaticamente senza conferma
-      "title": "titolo breve",
-      "reason": "spiegazione in italiano",
-      "expectedImpact": "impatto atteso",
-      "params": {
-        // per bid_reduce/bid_increase: keywordId, keywordText, currentBid, newBid, campaignName
-        // per pause_keyword: keywordId, keywordText, campaignName
-        // per add_negative: campaignId, adGroupId, keywordText, matchType, campaignName
-        // per adjust_budget: campaignId, campaignName, currentBudget, newBudget
-        // per pause_campaign: campaignId, campaignName
-      }
-    }
-  ]
-}`,
-        },
-        { role: "user", content: prompt },
+        { role: "system", content: getSystemPrompt() },
+        { role: "user", content: userMsg },
       ],
+      temperature: 0.2,
+      max_tokens: 2000,
+      response_format: { type: "json_object" },
     }),
   });
 
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OpenAI error ${res.status}: ${err.slice(0, 200)}`);
+  }
+
   const d = await res.json();
-  if (!d.choices?.[0]) throw new Error("OpenAI error: " + JSON.stringify(d));
-  const content = d.choices[0].message.content;
-  return JSON.parse(content);
+  const content = d.choices?.[0]?.message?.content;
+  if (!content) throw new Error("OpenAI: risposta vuota");
+
+  const result = JSON.parse(content);
+  console.log(`[AI] Summary: ${result.summary}`);
+  console.log(`[AI] Azioni generate: ${result.actions?.length || 0}`);
+
+  return result;
 }
 
-function buildPrompt(campaigns, keywords, searchTerms, actionLog) {
-  const campSummary = campaigns.map(c => ({
-    id: c.campaignId,
-    name: c.name,
+function buildContext(campaigns, keywords, searchTerms) {
+  // Campagne — top 20 per spesa
+  const campContext = campaigns.slice(0, 20).map(c => ({
+    id: String(c.campaignId || c.campaign_id || ""),
+    name: c.name || c.campaignName || "",
     state: c.state,
-    budget: c.budget,
-    spend: c.spend,
-    sales: c.sales,
-    acos: c.acos,
-    clicks: c.clicks,
-    impressions: c.impressions,
-    orders: c.orders,
-    roas: c.roas,
+    budget: c.dailyBudget ? (c.dailyBudget / 100).toFixed(2) : c.daily_budget,
+    spend7d: c.cost?.toFixed(2) || "0",
+    sales7d: c.sales?.toFixed(2) || "0",
+    orders7d: c.orders || 0,
+    acos: c.acos ? (c.acos * 100).toFixed(1) + "%" : "n/d",
+    clicks7d: c.clicks || 0,
+    impressions7d: c.impressions || 0,
+    cpc: c.cpc?.toFixed(2) || "0",
+    roas: c.roas?.toFixed(2) || "0",
   }));
 
-  const kwTop = keywords
-    .filter(k => k.clicks > 0)
-    .sort((a, b) => b.spend - a.spend)
-    .slice(0, 30)
-    .map(k => ({
-      id: k.keywordId,
-      text: k.keywordText,
-      match: k.matchType,
-      bid: k.bid,
-      clicks: k.clicks,
-      spend: k.spend,
-      orders: k.orders,
-      sales: k.sales,
-      acos: k.acos,
-      campaign: k.campaignName,
-      adGroupId: k.adGroupId,
-      campaignId: k.campaignId,
-    }));
+  // Keyword — top 50 per spesa
+  const kwContext = (keywords || []).slice(0, 50).map(k => {
+    const acos = (k.attributedSales14d || k.sales || 0) > 0
+      ? (k.cost || 0) / (k.attributedSales14d || k.sales)
+      : null;
+    return {
+      id: String(k.keywordId || k.keyword_id || ""),
+      text: k.keywordText || k.keyword_text || "",
+      match: k.matchType || k.match_type || "",
+      campaign: k.campaignName || k.campaign_name || "",
+      adGroup: k.adGroupName || k.ad_group_name || "",
+      state: k.state,
+      bid: k.bid?.toFixed(2) || "0",
+      clicks: k.clicks || 0,
+      spend: (k.cost || 0).toFixed(2),
+      orders: k.attributedConversions14d || k.orders || 0,
+      sales: (k.attributedSales14d || k.sales || 0).toFixed(2),
+      acos: acos !== null ? (acos * 100).toFixed(1) + "%" : "n/d",
+    };
+  });
 
-  const stTop = searchTerms
-    .filter(s => s.clicks > 3)
-    .sort((a, b) => b.spend - a.spend)
+  // Search term — top 30 problematici (click alti, 0 conv)
+  const stContext = (searchTerms || [])
+    .filter(s => (s.clicks || 0) >= 3)
+    .sort((a, b) => (b.cost || 0) - (a.cost || 0))
     .slice(0, 30)
     .map(s => ({
-      query: s.query,
-      campaign: s.campaignName,
-      campaignId: s.campaignId,
-      adGroupId: s.adGroupId,
-      clicks: s.clicks,
-      spend: s.spend,
-      orders: s.orders || s.attributedConversions14d,
-      sales: s.sales || s.attributedSales14d,
-      acos: s.acos,
+      query: s.query || s.keywordText || "",
+      campaign: s.campaignName || "",
+      adGroup: s.adGroupName || "",
+      clicks: s.clicks || 0,
+      spend: (s.cost || 0).toFixed(2),
+      orders: s.attributedConversions14d || 0,
+      sales: (s.attributedSales14d || 0).toFixed(2),
     }));
 
-  const recentActions = (actionLog || []).slice(0, 10).map(a =>
-    `${a.timestamp}: ${a.type} - ${a.description}`
-  );
-
-  return `
-Dati campagne (ultimi 7 giorni):
-${JSON.stringify(campSummary, null, 2)}
-
-Keyword top per spesa:
-${JSON.stringify(kwTop, null, 2)}
-
-Search term con più click:
-${JSON.stringify(stTop, null, 2)}
-
-Azioni recenti già eseguite (non ripetere):
-${recentActions.join("\n") || "Nessuna"}
-
-Data attuale: ${new Date().toISOString()}
-
-Analizza e fornisci le azioni di ottimizzazione più importanti. 
-Marca come "auto: true" solo le azioni sicure (riduci bid su ACoS > 80%, pausa keyword senza conversioni dopo 20+ click, aggiungi negativa search term con 10+ click e 0 conversioni).
-Tutto il resto "auto: false" (richiede conferma dell'utente).
-`;
-}
-
-// ── Auto-esecuzione azioni sicure ─────────────────────────────────────────────
-export async function executeAutoActions(actions, amazon) {
-  const results = [];
-
-  for (const action of actions.filter(a => a.auto)) {
-    try {
-      let result;
-      switch (action.type) {
-        case "bid_reduce":
-        case "bid_increase":
-          result = await amazon.updateKeyword(
-            action.params.keywordId,
-            action.params.newBid
-          );
-          break;
-
-        case "pause_keyword":
-          result = await amazon.pauseKeyword(action.params.keywordId);
-          break;
-
-        case "add_negative":
-          result = await amazon.addNegativeKeyword(
-            action.params.campaignId,
-            action.params.adGroupId,
-            action.params.keywordText,
-            action.params.matchType || "NEGATIVE_EXACT"
-          );
-          break;
-
-        case "adjust_budget":
-          result = await amazon.updateCampaign(action.params.campaignId, {
-            budget: { budget: action.params.newBudget, budgetType: "DAILY" }
-          });
-          break;
-
-        default:
-          continue;
-      }
-
-      results.push({
-        actionId: action.id,
-        type: action.type,
-        success: result.ok,
-        status: result.status,
-        description: action.title,
-        params: action.params,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (e) {
-      results.push({
-        actionId: action.id,
-        type: action.type,
-        success: false,
-        error: e.message,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  return results;
-}
-
-// ── Regole deterministiche (fallback senza AI / sempre attive) ────────────────
-export function applyRules(campaigns, keywords, searchTerms) {
-  const actions = [];
-  const acosTgt = ACOS_TARGET;
-
-  for (const kw of keywords) {
-    if (kw.state !== "ENABLED" && kw.state !== "enabled") continue;
-    const acos = kw.sales > 0 ? kw.spend / kw.sales : (kw.clicks >= 10 ? 999 : null);
-    if (acos === null) continue;
-
-    // ACoS > 2x target + 10+ click → riduci bid automaticamente
-    if (acos > acosTgt * 2 && kw.clicks >= 10) {
-      const newBid = acos < 999
-        ? Math.max(0.10, parseFloat((kw.bid * acosTgt / acos).toFixed(2)))
-        : parseFloat((kw.bid * 0.65).toFixed(2));
-      actions.push({
-        id: `rule-bid-${kw.keywordId}`,
-        type: "bid_reduce",
-        priority: acos > acosTgt * 3 ? "critical" : "high",
-        auto: true,
-        title: `Riduci offerta: "${kw.keywordText}"`,
-        reason: `ACoS ${acos === 999 ? "∞" : (acos*100).toFixed(0)}% — oltre 2x il target`,
-        expectedImpact: `ACoS → ~${(acosTgt*100).toFixed(0)}%`,
-        params: {
-          keywordId: kw.keywordId,
-          keywordText: kw.keywordText,
-          currentBid: kw.bid,
-          newBid,
-          campaignName: kw.campaignName,
-          campaignId: kw.campaignId,
-          adGroupId: kw.adGroupId,
-        },
-      });
-    }
-
-    // ACoS ok e budget sottoutilizzato → aumenta bid
-    if (acos < acosTgt * 0.6 && kw.clicks >= 5 && kw.bid < 2.0) {
-      const newBid = Math.min(2.0, parseFloat((kw.bid * 1.20).toFixed(2)));
-      actions.push({
-        id: `rule-bidup-${kw.keywordId}`,
-        type: "bid_increase",
-        priority: "low",
-        auto: false,
-        title: `Aumenta offerta: "${kw.keywordText}"`,
-        reason: `ACoS ${(acos*100).toFixed(0)}% — sotto target, si può scalare`,
-        expectedImpact: `+${Math.round(kw.clicks * 0.2)} click stimati`,
-        params: {
-          keywordId: kw.keywordId,
-          keywordText: kw.keywordText,
-          currentBid: kw.bid,
-          newBid,
-          campaignName: kw.campaignName,
-          campaignId: kw.campaignId,
-          adGroupId: kw.adGroupId,
-        },
-      });
-    }
-  }
-
-  // Search term: 15+ click, 0 conversioni → aggiungi negativa
-  for (const st of searchTerms) {
-    const conv = st.orders || st.attributedConversions14d || 0;
-    if (st.clicks >= 15 && conv === 0 && st.adGroupId) {
-      actions.push({
-        id: `rule-neg-${st.query?.replace(/\s+/g,"-")}`,
-        type: "add_negative",
-        priority: "high",
-        auto: true,
-        title: `Negativa: "${st.query}"`,
-        reason: `${st.clicks} click, €${(st.spend||0).toFixed(2)} spesi, 0 conversioni`,
-        expectedImpact: `Risparmio ~€${((st.spend||0)*0.9).toFixed(2)}`,
-        params: {
-          campaignId: st.campaignId,
-          adGroupId: st.adGroupId,
-          keywordText: st.query,
-          matchType: "NEGATIVE_EXACT",
-          campaignName: st.campaignName,
-        },
-      });
-    }
-  }
-
-  const order = { critical:0, high:1, medium:2, low:3 };
-  return actions.sort((a,b) => order[a.priority] - order[b.priority]);
+  return {
+    summary: {
+      totalSpend7d: campaigns.reduce((s, c) => s + (c.cost || 0), 0).toFixed(2),
+      totalSales7d: campaigns.reduce((s, c) => s + (c.sales || 0), 0).toFixed(2),
+      totalOrders7d: campaigns.reduce((s, c) => s + (c.orders || 0), 0),
+      acosTarget: (cfg().ACOS_TARGET * 100).toFixed(0) + "%",
+      dailyBudgetMax: "€" + cfg().BUDGET_MAX,
+    },
+    campaigns: campContext,
+    keywords: kwContext,
+    searchTerms: stContext,
+  };
 }

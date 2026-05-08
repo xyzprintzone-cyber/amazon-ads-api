@@ -1,2 +1,6 @@
 node_modules/
 .env
+optimizer.db
+optimizer.db-shm
+optimizer.db-wal
+.env
