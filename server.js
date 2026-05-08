@@ -1,475 +1,611 @@
-import { createServer } from "http";
-import * as amazon from "./amazon.js";
-import { mockCampaigns, mockKeywords, mockSearchTerms } from "./mock-data.js";
-import { parseAmazonCSV } from "./csv-parser.js";
+// server.js — XYZ Print Zone Amazon Ads API
+// Real data from Amazon Advertising API v3 + GPT-4o auto-optimization
 
-// ── CSV Data Store (in-memory, survives cold starts per sessione) ──────────────
-let csvStore = null; // { campaigns, keywords, searchTerms, dateRange, uploadedAt, rowCount }
+import { createServer } from "http";
+import * as amazon from "./amazon-real.js";
+import { analyzeWithAI, executeAutoActions, applyRules } from "./ai-engine.js";
 
 const PORT = process.env.PORT || 8787;
 const ACOS_TARGET = parseFloat(process.env.ACOS_TARGET || "0.40");
-const DAILY_BUDGET_MAX = parseFloat(process.env.DAILY_BUDGET_MAX || "30.00");
+const BUDGET_MAX = parseFloat(process.env.DAILY_BUDGET_MAX || "30.00");
+
+// ── In-memory cache ───────────────────────────────────────────────────────────
+const cache = {
+  campaigns: null,      // { data, ts }
+  keywords: null,
+  adGroups: null,
+  // Report caches: { data, ts, status: "ready"|"fetching"|"error", error? }
+  campaignPerf: null,
+  keywordPerf: null,
+  searchTermPerf: null,
+  lastOptimization: null,
+};
+const CACHE_TTL       = 5  * 60 * 1000;  // 5 min — campaigns/kw
+const REPORT_TTL      = 60 * 60 * 1000;  // 1 hr  — report data
+
+// Pending confirmations queue (actions AI wants to take but need approval)
+const pendingActions = [];
+const actionLog      = [];
+
+function logAction(type, description, params = {}, success = true) {
+  actionLog.unshift({ id: Date.now().toString(), type, description, params, success, timestamp: new Date().toISOString() });
+  if (actionLog.length > 200) actionLog.pop();
+  console.log(`[${success ? "OK" : "ERR"}] ${type}: ${description}`);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-function daysAgoStr(n) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
-}
+function today()      { return new Date().toISOString().slice(0, 10); }
+function daysAgoStr(n){ const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); }
 
 function json(res, data, status = 200) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   res.end(JSON.stringify(data));
 }
 
 async function readBody(req) {
-  return new Promise((resolve) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      try { resolve(JSON.parse(body)); } catch { resolve({}); }
-    });
+  return new Promise(resolve => {
+    let b = "";
+    req.on("data", c => b += c);
+    req.on("end", () => { try { resolve(JSON.parse(b)); } catch { resolve({}); } });
   });
 }
 
-async function readRawBody(req) {
-  return new Promise((resolve) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
+function isCacheValid(entry, ttl = CACHE_TTL) {
+  return entry && (Date.now() - entry.ts) < ttl;
 }
 
-// Restituisce campagne attive: CSV se caricato, altrimenti mock
-function activeCampaigns() {
-  return csvStore ? csvStore.campaigns : mockCampaigns;
-}
-function activeKeywords() {
-  return csvStore ? csvStore.keywords : mockKeywords;
-}
-function activeSearchTerms() {
-  return csvStore ? csvStore.searchTerms : mockSearchTerms;
-}
-
-// ── Date-range aggregation ────────────────────────────────────────────────────
-function aggregateCampaignStats(campaign, startDate, endDate) {
-  const stats = campaign.dailyStats || [];
-  const filtered = stats.filter(s => s.date >= startDate && s.date <= endDate);
-
-  const agg = filtered.reduce(
-    (acc, s) => ({
-      cost: acc.cost + s.cost,
-      clicks: acc.clicks + s.clicks,
-      impressions: acc.impressions + s.impressions,
-      orders: acc.orders + s.orders,
-      sales: acc.sales + s.sales,
-    }),
-    { cost: 0, clicks: 0, impressions: 0, orders: 0, sales: 0 }
-  );
-
-  const acos = agg.sales > 0 ? agg.cost / agg.sales : null;
-  const ctr  = agg.impressions > 0 ? agg.clicks / agg.impressions : 0;
-  const cpc  = agg.clicks > 0 ? agg.cost / agg.clicks : 0;
-  const roas = agg.cost > 0 ? agg.sales / agg.cost : null;
-
+// ── Data Loaders ─────────────────────────────────────────────────────────────
+function normalizeCampaign(c) {
   return {
-    campaignId: campaign.campaignId,
-    name: campaign.name,
-    state: campaign.state,
-    dailyBudget: campaign.dailyBudget,
-    targetingType: campaign.targetingType,
-    cost: parseFloat(agg.cost.toFixed(2)),
-    clicks: agg.clicks,
-    impressions: agg.impressions,
-    orders: agg.orders,
-    sales: parseFloat(agg.sales.toFixed(2)),
-    acos: acos !== null ? parseFloat(acos.toFixed(4)) : null,
-    ctr: parseFloat(ctr.toFixed(4)),
-    cpc: parseFloat(cpc.toFixed(2)),
-    roas: roas !== null ? parseFloat(roas.toFixed(2)) : null,
+    campaignId:   c.campaignId,
+    name:         c.name,
+    state:        c.state,
+    targetingType:c.targetingType,
+    budget:       c.budget?.budget ?? c.dynamicBidding?.budget ?? 0,
+    budgetType:   c.budget?.budgetType ?? "DAILY",
+    startDate:    c.startDate,
+    endDate:      c.endDate,
+    bidding:      c.dynamicBidding,
   };
 }
 
-// ── AI Engine ─────────────────────────────────────────────────────────────────
-function generateAIRecommendations(startDate, endDate) {
-  const recs = [];
-  const campaignStats = activeCampaigns().map(c => aggregateCampaignStats(c, startDate, endDate));
-
-  // 1. Keyword ACoS > target AND clicks ≥ 5
-  for (const kw of activeKeywords()) {
-    if (kw.state !== "enabled") continue;
-    const acos = kw.attributedSales14d > 0
-      ? kw.cost / kw.attributedSales14d
-      : (kw.clicks >= 5 ? 999 : null);
-    if (acos === null || acos <= ACOS_TARGET) continue;
-
-    const suggestedBid = acos < 999
-      ? Math.max(0.10, parseFloat((kw.bid * (ACOS_TARGET / acos)).toFixed(2)))
-      : parseFloat((kw.bid * 0.70).toFixed(2));
-
-    recs.push({
-      id: `bid-reduce-${kw.keywordId}`,
-      type: "bid_reduce",
-      priority: acos > 1.0 ? "high" : "medium",
-      title: `Riduci offerta: "${kw.keywordText}"`,
-      description: `ACoS ${acos === 999 ? "∞" : (acos * 100).toFixed(0)}% (target ${(ACOS_TARGET * 100).toFixed(0)}%) · ${kw.clicks} click senza conversioni sufficienti`,
-      action: `Riduci offerta da €${kw.bid.toFixed(2)} → €${suggestedBid.toFixed(2)}`,
-      expectedImpact: acos < 999
-        ? `ACoS stimato ~${(ACOS_TARGET * 100).toFixed(0)}%`
-        : `Risparmio ~€${((kw.bid - suggestedBid) * kw.clicks / 30).toFixed(2)}/gg`,
-      data: { keywordId: kw.keywordId, keywordText: kw.keywordText, currentBid: kw.bid, suggestedBid, acos },
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  // 2. Search term clicks ≥ 5 + 0 conversioni → negativa
-  const existingKwTexts = new Set(activeKeywords().map(k => k.keywordText.toLowerCase()));
-  for (const st of activeSearchTerms()) {
-    if (st.clicks >= 5 && st.attributedConversions14d === 0) {
-      recs.push({
-        id: `negative-${st.query.replace(/\s+/g, "-")}`,
-        type: "add_negative",
-        priority: st.clicks >= 20 ? "high" : "medium",
-        title: `Keyword negativa: "${st.query}"`,
-        description: `${st.clicks} click · €${st.cost.toFixed(2)} spesi · 0 conversioni in "${st.campaignName}"`,
-        action: `Aggiungi "${st.query}" come negativa (exact match)`,
-        expectedImpact: `Risparmio ~€${(st.cost * 0.8).toFixed(2)} nel periodo`,
-        data: { query: st.query, campaignName: st.campaignName, clicks: st.clicks, cost: st.cost },
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  // 3. Search term con ≥2 conversioni non in keyword → aggiungi
-  for (const st of activeSearchTerms()) {
-    if (existingKwTexts.has(st.query.toLowerCase())) continue;
-    if (st.attributedConversions14d < 2) continue;
-    const cvr = st.clicks > 0 ? st.attributedConversions14d / st.clicks : 0;
-    const suggestedBid = st.clicks > 0
-      ? parseFloat((st.cost / st.clicks * 1.1).toFixed(2))
-      : 0.50;
-    recs.push({
-      id: `add-keyword-${st.query.replace(/\s+/g, "-")}`,
-      type: "add_keyword",
-      priority: st.attributedConversions14d >= 3 ? "high" : "medium",
-      title: `Aggiungi keyword: "${st.query}"`,
-      description: `${st.attributedConversions14d} conversioni · CVR ${(cvr * 100).toFixed(0)}% · non presente nelle keyword manuali`,
-      action: `Aggiungi come exact match · offerta consigliata €${suggestedBid.toFixed(2)}`,
-      expectedImpact: `ACoS stimato ${st.attributedSales14d > 0 ? ((st.cost / st.attributedSales14d) * 100).toFixed(0) : "n/d"}%`,
-      data: { query: st.query, campaignName: st.campaignName, conversions: st.attributedConversions14d, suggestedBid },
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  // 4. Budget sottoutilizzato + ACoS ok → alza offerte
-  for (const cs of campaignStats) {
-    if (cs.state !== "enabled" || cs.cost === 0) continue;
-    const days = Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1);
-    const totalBudget = (cs.dailyBudget / 100) * days;
-    const spendRatio = cs.cost / totalBudget;
-    if (spendRatio < 0.5 && cs.acos !== null && cs.acos < ACOS_TARGET) {
-      recs.push({
-        id: `budget-underuse-${cs.campaignId}`,
-        type: "bid_increase",
-        priority: "low",
-        title: `Budget sottoutilizzato: "${cs.name}"`,
-        description: `Solo ${(spendRatio * 100).toFixed(0)}% del budget usato · €${cs.cost.toFixed(2)}/€${totalBudget.toFixed(2)} · ACoS ${(cs.acos * 100).toFixed(0)}%`,
-        action: `Aumenta le offerte del 15-20% sulle keyword top per sfruttare il budget`,
-        expectedImpact: `+${Math.round(cs.orders * 0.2)} ordini stimati nel periodo`,
-        data: { campaignId: cs.campaignId, spendRatio, currentAcos: cs.acos },
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  // 5. ACoS alert — campagne sopra target
-  for (const cs of campaignStats) {
-    if (cs.state !== "enabled" || cs.sales <= 0 || cs.acos === null) continue;
-    if (cs.acos > ACOS_TARGET) {
-      recs.push({
-        id: `acos-alert-${cs.campaignId}`,
-        type: "acos_alert",
-        priority: cs.acos > 0.80 ? "high" : "medium",
-        title: `ACoS elevato: "${cs.name}"`,
-        description: `ACoS ${(cs.acos * 100).toFixed(0)}% vs target ${(ACOS_TARGET * 100).toFixed(0)}% · €${cs.cost.toFixed(2)} spesi · €${cs.sales.toFixed(2)} vendite`,
-        action: `Rivedi le offerte e metti in pausa le keyword meno performanti`,
-        expectedImpact: `Riduzione ACoS a ~${(ACOS_TARGET * 100).toFixed(0)}%`,
-        data: { campaignId: cs.campaignId, acos: cs.acos, cost: cs.cost, sales: cs.sales },
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  const order = { high: 0, medium: 1, low: 2 };
-  recs.sort((a, b) => order[a.priority] - order[b.priority]);
-  return recs;
+async function loadCampaigns(forceRefresh = false) {
+  if (!forceRefresh && isCacheValid(cache.campaigns)) return cache.campaigns.data;
+  const { ok, data } = await amazon.getCampaigns();
+  if (!ok) throw new Error("getCampaigns failed: " + JSON.stringify(data));
+  const campaigns = (data.campaigns || []).map(normalizeCampaign);
+  cache.campaigns = { data: campaigns, ts: Date.now() };
+  return campaigns;
 }
+
+async function loadKeywords(campaignId = null, forceRefresh = false) {
+  if (!forceRefresh && isCacheValid(cache.keywords)) return cache.keywords.data;
+  const { ok, data } = await amazon.getKeywords(campaignId);
+  if (!ok) throw new Error("getKeywords failed: " + JSON.stringify(data));
+  const kws = (data.keywords || []).map(k => ({
+    keywordId:  k.keywordId,
+    campaignId: k.campaignId,
+    adGroupId:  k.adGroupId,
+    keywordText:k.keywordText,
+    matchType:  k.matchType,
+    state:      k.state,
+    bid:        k.bid?.bidValue ?? 0,
+  }));
+  cache.keywords = { data: kws, ts: Date.now() };
+  return kws;
+}
+
+// ── Background Report Fetcher ─────────────────────────────────────────────────
+// Returns cached data immediately if fresh. Starts background fetch if stale/missing.
+// Frontend can poll — will get data within 2-5 minutes when report completes.
+
+function startReportFetch(cacheKey, fetchFn) {
+  if (cache[cacheKey] && cache[cacheKey].status === "fetching") return; // already in progress
+  if (isCacheValid(cache[cacheKey], REPORT_TTL) && cache[cacheKey].status === "ready") return; // fresh
+
+  cache[cacheKey] = { data: cache[cacheKey]?.data || null, ts: cache[cacheKey]?.ts || 0, status: "fetching" };
+  console.log(`[REPORT] Starting background fetch: ${cacheKey}`);
+
+  fetchFn().then(data => {
+    cache[cacheKey] = { data, ts: Date.now(), status: "ready" };
+    console.log(`[REPORT] ${cacheKey} ready — ${Array.isArray(data) ? data.length : "?"} rows`);
+  }).catch(err => {
+    cache[cacheKey] = { data: cache[cacheKey]?.data || null, ts: cache[cacheKey]?.ts || 0, status: "error", error: err.message };
+    console.error(`[REPORT] ${cacheKey} error: ${err.message}`);
+  });
+}
+
+function getCachedReport(cacheKey) {
+  const e = cache[cacheKey];
+  return {
+    status:    e?.status || "idle",
+    data:      e?.data   || null,
+    ts:        e?.ts     || null,
+    error:     e?.error  || null,
+    ageMin:    e?.ts ? Math.round((Date.now() - e.ts) / 60000) : null,
+  };
+}
+
+// ── Aggregation ───────────────────────────────────────────────────────────────
+function aggregateReportByCampaign(rows) {
+  const map = {};
+  for (const r of rows) {
+    const k = r.campaignId || r.campaignName;
+    if (!map[k]) map[k] = { campaignId: r.campaignId, campaignName: r.campaignName, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
+    map[k].spend       += r.spend       || 0;
+    map[k].clicks      += r.clicks      || 0;
+    map[k].impressions += r.impressions || 0;
+    map[k].orders      += r.orders      || 0;
+    map[k].sales       += r.sales7d     || r.attributedSales14d || 0;
+  }
+  return Object.values(map).map(c => ({
+    ...c,
+    acos:  c.sales > 0 ? c.spend / c.sales : null,
+    roas:  c.spend > 0 ? c.sales / c.spend : null,
+    ctr:   c.impressions > 0 ? c.clicks / c.impressions : null,
+    cpc:   c.clicks > 0 ? c.spend / c.clicks : null,
+  }));
+}
+
+function aggregateReportByKeyword(rows) {
+  const map = {};
+  for (const r of rows) {
+    const k = r.keywordId || `${r.keywordText}-${r.matchType}`;
+    if (!map[k]) map[k] = {
+      keywordId: r.keywordId, keywordText: r.keywordText, matchType: r.matchType,
+      campaignId: r.campaignId, campaignName: r.campaignName,
+      adGroupId: r.adGroupId, bid: r.bid || 0,
+      spend:0, clicks:0, impressions:0, orders:0, sales:0,
+    };
+    map[k].spend       += r.spend       || 0;
+    map[k].clicks      += r.clicks      || 0;
+    map[k].impressions += r.impressions || 0;
+    map[k].orders      += r.orders      || r.attributedConversions14d || 0;
+    map[k].sales       += r.sales7d     || r.attributedSales14d || 0;
+  }
+  return Object.values(map).map(k => ({
+    ...k,
+    acos:  k.sales > 0 ? k.spend / k.sales : null,
+    roas:  k.spend > 0 ? k.sales / k.spend : null,
+    ctr:   k.impressions > 0 ? k.clicks / k.impressions : null,
+    cpc:   k.clicks > 0 ? k.spend / k.clicks : null,
+  }));
+}
+
+function aggregateReportByDate(rows) {
+  const map = {};
+  for (const r of rows) {
+    const d = r.date || "unknown";
+    if (!map[d]) map[d] = { date: d, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
+    map[d].spend       += r.spend       || 0;
+    map[d].clicks      += r.clicks      || 0;
+    map[d].impressions += r.impressions || 0;
+    map[d].orders      += r.orders      || 0;
+    map[d].sales       += r.sales7d     || r.attributedSales14d || 0;
+  }
+  return Object.values(map).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function calcMetrics(rows) {
+  const totals = rows.reduce((acc, r) => ({
+    spend:       acc.spend       + (r.spend || 0),
+    clicks:      acc.clicks      + (r.clicks || 0),
+    impressions: acc.impressions + (r.impressions || 0),
+    orders:      acc.orders      + (r.orders || 0),
+    sales:       acc.sales       + (r.sales || 0),
+  }), { spend:0, clicks:0, impressions:0, orders:0, sales:0 });
+
+  return {
+    ...totals,
+    acos:  totals.sales > 0 ? totals.spend / totals.sales : null,
+    roas:  totals.spend > 0 ? totals.sales / totals.spend : null,
+    ctr:   totals.impressions > 0 ? totals.clicks / totals.impressions : null,
+    cpc:   totals.clicks > 0 ? totals.spend / totals.clicks : null,
+  };
+}
+
+// ── AI Optimization ───────────────────────────────────────────────────────────
+let optimizationRunning = false;
+
+async function runOptimization() {
+  if (optimizationRunning) {
+    console.log("[AI] Optimization already running, skipping");
+    return;
+  }
+  optimizationRunning = true;
+  console.log("[AI] Starting hourly optimization...");
+  const startTs = Date.now();
+
+  try {
+    // 1. Trigger fresh report data (background — non-blocking)
+    const start14 = daysAgoStr(14);
+    const end0 = today();
+    startReportFetch("campaignPerf",  () => amazon.getCampaignPerformance(start14, end0));
+    startReportFetch("keywordPerf",   () => amazon.getKeywordPerformance(start14, end0));
+    startReportFetch("searchTermPerf",() => amazon.getSearchTermPerformance(start14, end0));
+
+    // 2. Wait up to 8 minutes for at least campaign report
+    let waited = 0;
+    while (waited < 480000) {
+      if (cache.campaignPerf?.status === "ready") break;
+      if (cache.campaignPerf?.status === "error") {
+        logAction("optimization", "Report fetch failed: " + cache.campaignPerf.error, {}, false);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 15000));
+      waited += 15000;
+    }
+    if (!cache.campaignPerf?.data) {
+      logAction("optimization", "Campaign report not ready after 8 min wait", {}, false);
+      return;
+    }
+
+    // 3. Load campaigns + keywords structure
+    const [campaigns, keywords] = await Promise.all([
+      loadCampaigns(true),
+      loadKeywords(null, true),
+    ]);
+
+    // 4. Aggregate report data
+    const campPerf = aggregateReportByCampaign(cache.campaignPerf.data);
+    const kwPerf   = cache.keywordPerf?.data ? aggregateReportByKeyword(cache.keywordPerf.data) : [];
+
+    // 5. Merge campaign structure + performance
+    const merged = campaigns.map(c => {
+      const perf = campPerf.find(p => p.campaignId === c.campaignId) || {};
+      return { ...c, ...perf };
+    });
+
+    // 6. AI analysis
+    const aiResult = await analyzeWithAI({ campaigns: merged, keywords: kwPerf, acosTarget: ACOS_TARGET, budgetMax: BUDGET_MAX });
+    logAction("ai_analysis", `GPT-4o analysis complete — ${aiResult.recommendations?.length || 0} recommendations`, {});
+
+    // 7. Auto-execute safe actions (no approval needed)
+    const autoActions = (aiResult.recommendations || []).filter(r => r.autoExecute);
+    const manualActions = (aiResult.recommendations || []).filter(r => !r.autoExecute);
+
+    // Add manual actions to pending queue
+    for (const action of manualActions) {
+      const exists = pendingActions.find(p => p.id === action.id);
+      if (!exists) pendingActions.push({ ...action, addedAt: new Date().toISOString() });
+    }
+    if (pendingActions.length > 50) pendingActions.splice(50);
+
+    // Apply rule-based actions on top
+    const ruleActions = applyRules({ campaigns: merged, keywords: kwPerf, acosTarget: ACOS_TARGET });
+    const allAuto = [...autoActions, ...ruleActions.filter(r => r.autoExecute)];
+
+    if (allAuto.length > 0) {
+      const execResults = await executeAutoActions(allAuto, amazon);
+      for (const r of execResults) {
+        logAction(r.type, r.description, r.params, r.success);
+      }
+    }
+
+    const duration = Math.round((Date.now() - startTs) / 1000);
+    cache.lastOptimization = {
+      ts: new Date().toISOString(),
+      durationSec: duration,
+      campaignsAnalyzed: merged.length,
+      keywordsAnalyzed: kwPerf.length,
+      autoActionsExecuted: allAuto.length,
+      pendingCount: manualActions.length,
+      recommendations: aiResult.recommendations || [],
+      summary: aiResult.summary || "",
+    };
+    logAction("optimization", `Complete in ${duration}s — ${allAuto.length} auto, ${manualActions.length} pending`, {});
+  } catch (err) {
+    console.error("[AI] Optimization error:", err);
+    logAction("optimization", "Error: " + err.message, {}, false);
+  } finally {
+    optimizationRunning = false;
+  }
+}
+
+// ── Scheduler: run every hour ─────────────────────────────────────────────────
+setTimeout(() => runOptimization(), 30 * 1000);          // first run 30s after boot
+setInterval(() => runOptimization(), 60 * 60 * 1000);    // then every hour
 
 // ── HTTP Server ───────────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const path = url.pathname;
+  const url    = new URL(req.url, `http://localhost`);
+  const path   = url.pathname;
+  const params = url.searchParams;
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
-    res.end();
-    return;
+    return res.end();
   }
 
   try {
-    // Health
+    // ── Health ──
     if (path === "/api/health") {
-      return json(res, { ok: true, ts: Date.now(), mock: process.env.USE_MOCK !== "false" });
-    }
-
-    // Campaigns
-    if (path === "/api/campaigns" && req.method === "GET") {
-      const stateFilter = url.searchParams.get("state");
-      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
-      const endDate     = url.searchParams.get("endDate")   || todayStr();
-      const result = await amazon.getCampaigns();
-      let campaigns = result.data;
-      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
-      const data = campaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
-      return json(res, data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/campaigns" && req.method === "PUT") {
-      const body = await readBody(req);
-      const result = await amazon.updateCampaign(body.campaignId, body.updates);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    // Summary
-    if (path === "/api/summary" && req.method === "GET") {
-      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
-      const endDate     = url.searchParams.get("endDate")   || todayStr();
-      const stateFilter = url.searchParams.get("state");
-      let campaigns = activeCampaigns();
-      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
-      const stats = campaigns.map(c => aggregateCampaignStats(c, startDate, endDate));
-      const t = stats.reduce(
-        (acc, s) => ({ cost: acc.cost+s.cost, clicks: acc.clicks+s.clicks, impressions: acc.impressions+s.impressions, orders: acc.orders+s.orders, sales: acc.sales+s.sales }),
-        { cost: 0, clicks: 0, impressions: 0, orders: 0, sales: 0 }
-      );
-      return json(res, {
-        cost:         parseFloat(t.cost.toFixed(2)),
-        clicks:       t.clicks,
-        impressions:  t.impressions,
-        orders:       t.orders,
-        sales:        parseFloat(t.sales.toFixed(2)),
-        acos:         t.sales > 0 ? parseFloat((t.cost/t.sales).toFixed(4)) : null,
-        ctr:          t.impressions > 0 ? parseFloat((t.clicks/t.impressions).toFixed(4)) : 0,
-        cpc:          t.clicks > 0 ? parseFloat((t.cost/t.clicks).toFixed(2)) : 0,
-        roas:         t.cost > 0 ? parseFloat((t.sales/t.cost).toFixed(2)) : null,
-        activeCampaigns: stats.filter(s => s.state === "enabled").length,
-        startDate, endDate,
-      });
-    }
-
-    // Chart
-    if (path === "/api/chart" && req.method === "GET") {
-      const startDate   = url.searchParams.get("startDate") || daysAgoStr(7);
-      const endDate     = url.searchParams.get("endDate")   || todayStr();
-      const stateFilter = url.searchParams.get("state");
-      let campaigns = activeCampaigns();
-      if (stateFilter && stateFilter !== "all") campaigns = campaigns.filter(c => c.state === stateFilter);
-      const byDate = {};
-      for (const camp of campaigns) {
-        for (const s of (camp.dailyStats || [])) {
-          if (s.date < startDate || s.date > endDate) continue;
-          if (!byDate[s.date]) byDate[s.date] = { date: s.date, cost: 0, clicks: 0, impressions: 0, orders: 0, sales: 0 };
-          byDate[s.date].cost        += s.cost;
-          byDate[s.date].clicks      += s.clicks;
-          byDate[s.date].impressions += s.impressions;
-          byDate[s.date].orders      += s.orders;
-          byDate[s.date].sales       += s.sales;
-        }
-      }
-      const rows = Object.values(byDate).sort((a,b) => a.date.localeCompare(b.date)).map(r => ({
-        ...r,
-        cost:  parseFloat(r.cost.toFixed(2)),
-        sales: parseFloat(r.sales.toFixed(2)),
-        acos:  r.sales > 0 ? parseFloat((r.cost/r.sales).toFixed(4)) : null,
-      }));
-      return json(res, rows);
-    }
-
-    // Keywords
-    if (path === "/api/keywords" && req.method === "GET") {
-      const campaignId  = url.searchParams.get("campaignId");
-      const stateFilter = url.searchParams.get("state");
-      const result = await amazon.getKeywords(campaignId);
-      let data = result.data;
-      if (stateFilter) data = data.filter(k => k.state === stateFilter);
-      return json(res, data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/keywords/bid" && req.method === "PUT") {
-      const body = await readBody(req);
-      const result = await amazon.updateKeyword(body.keywordId, body.bid);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/keywords/pause" && req.method === "PUT") {
-      const body = await readBody(req);
-      const result = await amazon.pauseKeyword(body.keywordId);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/keywords/negative" && req.method === "POST") {
-      const body = await readBody(req);
-      const result = await amazon.addNegativeKeyword(body.campaignId, body.adGroupId, body.keywordText);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/adgroups" && req.method === "GET") {
-      const campaignId = url.searchParams.get("campaignId");
-      const result = await amazon.getAdGroups(campaignId);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/report/request" && req.method === "POST") {
-      const result = await amazon.requestSearchTermReport();
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path.startsWith("/api/report/") && path.split("/").length === 4 && req.method === "GET") {
-      const reportId = path.split("/")[3];
-      const result = await amazon.getReport(reportId);
-      return json(res, result.data, result.ok ? 200 : 500);
-    }
-
-    if (path === "/api/report/download" && req.method === "POST") {
-      const body = await readBody(req);
-      const data = await amazon.downloadReport(body.url);
-      return json(res, data);
-    }
-
-    // AI Recommendations
-    if (path === "/api/ai/recommendations" && req.method === "GET") {
-      const startDate = url.searchParams.get("startDate") || daysAgoStr(7);
-      const endDate   = url.searchParams.get("endDate")   || todayStr();
-      const recs = generateAIRecommendations(startDate, endDate);
-      return json(res, { ok: true, count: recs.length, recommendations: recs, generatedAt: new Date().toISOString() });
-    }
-
-    // AI Apply
-    if (path === "/api/ai/apply" && req.method === "POST") {
-      const body = await readBody(req);
-      const { recommendationId, type, data: actionData } = body;
-      console.log(`[AI APPLY] ${type}: ${JSON.stringify(actionData)}`);
-      if (type === "bid_reduce" && actionData?.keywordId) {
-        const kw = activeKeywords().find(k => k.keywordId === actionData.keywordId);
-        if (kw) kw.bid = actionData.suggestedBid;
-      }
-      return json(res, { ok: true, applied: recommendationId, timestamp: new Date().toISOString() });
-    }
-
-    // ── CSV Upload ──────────────────────────────────────────────────────────────
-    // POST /api/csv/upload  — body: raw CSV text (Content-Type: text/plain o multipart)
-    if (path === "/api/csv/upload" && req.method === "POST") {
-      const contentType = req.headers["content-type"] || "";
-      let csvText = "";
-
-      if (contentType.includes("multipart/form-data")) {
-        // Estrai testo dal multipart (cerca il body dopo headers vuoti)
-        const raw = await readRawBody(req);
-        const boundary = contentType.split("boundary=")[1];
-        if (boundary) {
-          const parts = raw.split("--" + boundary);
-          for (const part of parts) {
-            if (part.includes("filename=") || part.includes('name="file"') || part.includes('name="csv"')) {
-              const bodyStart = part.indexOf("\r\n\r\n");
-              if (bodyStart !== -1) {
-                csvText = part.slice(bodyStart + 4).replace(/\r\n--$/, "").trim();
-                break;
-              }
-            }
-          }
-          // fallback: prendi qualsiasi parte con contenuto
-          if (!csvText) {
-            for (const part of parts) {
-              const bodyStart = part.indexOf("\r\n\r\n");
-              if (bodyStart !== -1) {
-                const candidate = part.slice(bodyStart + 4).replace(/\r\n--$/, "").trim();
-                if (candidate.length > 10) { csvText = candidate; break; }
-              }
-            }
-          }
-        }
-      } else {
-        // text/plain o application/octet-stream
-        csvText = await readRawBody(req);
-      }
-
-      if (!csvText || csvText.length < 10) {
-        return json(res, { ok: false, error: "CSV vuoto o non leggibile" }, 400);
-      }
-
-      const result = parseAmazonCSV(csvText);
-      if (!result.ok) {
-        return json(res, result, 400);
-      }
-
-      csvStore = result;
-      console.log(`[CSV UPLOAD] ${result.rowCount} righe · ${result.campaigns.length} campagne · ${result.type}`);
-
       return json(res, {
         ok: true,
-        message: `Importato: ${result.rowCount} righe, ${result.campaigns.length} campagne`,
-        type: result.type,
-        campaigns: result.campaigns.length,
-        keywords: result.keywords.length,
-        searchTerms: result.searchTerms.length,
-        dateRange: result.dateRange,
-        uploadedAt: result.uploadedAt,
+        ts: Date.now(),
+        mock: false,
+        source: "amazon-api-v3",
+        cacheAge: {
+          campaigns:   cache.campaigns  ? Math.round((Date.now()-cache.campaigns.ts)/1000)+"s"  : "empty",
+          keywords:    cache.keywords   ? Math.round((Date.now()-cache.keywords.ts)/1000)+"s"   : "empty",
+          campPerf:    cache.campaignPerf?.status  || "idle",
+          kwPerf:      cache.keywordPerf?.status   || "idle",
+          stPerf:      cache.searchTermPerf?.status|| "idle",
+        },
+        lastOptimization: cache.lastOptimization,
+        optimizationRunning,
+        pendingActions: pendingActions.length,
       });
     }
 
-    // GET /api/csv/status — controlla se c'è un CSV caricato
-    if (path === "/api/csv/status" && req.method === "GET") {
-      if (!csvStore) {
-        return json(res, { hasData: false, source: "mock" });
+    // ── Campaigns ──
+    if (path === "/api/campaigns" && req.method === "GET") {
+      try {
+        const campaigns = await loadCampaigns();
+
+        // Attach perf data if available
+        const campPerf = cache.campaignPerf?.status === "ready" && cache.campaignPerf.data
+          ? aggregateReportByCampaign(cache.campaignPerf.data)
+          : [];
+
+        const result = campaigns.map(c => {
+          const perf = campPerf.find(p => p.campaignId === c.campaignId) || {};
+          return { ...c, ...perf };
+        });
+
+        return json(res, {
+          campaigns: result,
+          perfStatus: cache.campaignPerf?.status || "idle",
+          perfAge: cache.campaignPerf?.ts ? Math.round((Date.now()-cache.campaignPerf.ts)/60000)+"min" : null,
+          count: result.length,
+        });
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
       }
+    }
+
+    // ── Update campaign ──
+    if (path === "/api/campaigns" && req.method === "PUT") {
+      const body = await readBody(req);
+      const { ok, data } = await amazon.updateCampaign(body.campaignId, body.updates);
+      logAction("campaign_update", `Updated campaign ${body.campaignId}`, body, ok);
+      return json(res, { ok, data });
+    }
+
+    // ── Summary / KPIs ──
+    if (path === "/api/summary") {
+      const start = params.get("start") || daysAgoStr(14);
+      const end   = params.get("end")   || today();
+
+      // Trigger background fetch if needed
+      startReportFetch("campaignPerf",  () => amazon.getCampaignPerformance(start, end));
+
+      const cached = getCachedReport("campaignPerf");
+      if (cached.status !== "ready" || !cached.data) {
+        return json(res, {
+          status: cached.status,
+          message: cached.status === "fetching"
+            ? "Report in elaborazione — riprova tra 2-3 minuti"
+            : cached.status === "error"
+            ? "Errore report: " + cached.error
+            : "Nessun dato — avvia refresh",
+          data: null,
+        });
+      }
+
+      const rows       = cached.data;
+      const metrics    = calcMetrics(rows);
+      const byDate     = aggregateReportByDate(rows);
+      const byCampaign = aggregateReportByCampaign(rows);
+
       return json(res, {
-        hasData: true,
-        source: "csv",
-        type: csvStore.type,
-        campaigns: csvStore.campaigns.length,
-        keywords: csvStore.keywords.length,
-        searchTerms: csvStore.searchTerms.length,
-        dateRange: csvStore.dateRange,
-        uploadedAt: csvStore.uploadedAt,
-        rowCount: csvStore.rowCount,
+        status: "ready",
+        dateRange: { start, end },
+        metrics,
+        byDate,
+        byCampaign,
+        reportAge: cached.ageMin + " min",
       });
     }
 
-    // DELETE /api/csv/clear — torna ai dati mock
-    if (path === "/api/csv/clear" && req.method === "DELETE") {
-      csvStore = null;
-      return json(res, { ok: true, message: "Dati CSV rimossi, tornato ai dati mock" });
+    // ── Chart data ──
+    if (path === "/api/chart") {
+      const start = params.get("start") || daysAgoStr(14);
+      const end   = params.get("end")   || today();
+      startReportFetch("campaignPerf", () => amazon.getCampaignPerformance(start, end));
+      const cached = getCachedReport("campaignPerf");
+      if (cached.status !== "ready" || !cached.data) {
+        return json(res, { status: cached.status, data: [] });
+      }
+      const byDate = aggregateReportByDate(cached.data);
+      return json(res, { status: "ready", data: byDate });
     }
 
-    json(res, { error: "Not found" }, 404);
+    // ── Keywords ──
+    if (path === "/api/keywords" && req.method === "GET") {
+      try {
+        const keywords = await loadKeywords();
+
+        // Attach perf
+        const kwPerf = cache.keywordPerf?.status === "ready" && cache.keywordPerf.data
+          ? aggregateReportByKeyword(cache.keywordPerf.data)
+          : [];
+
+        const result = keywords.map(k => {
+          const perf = kwPerf.find(p => p.keywordId === k.keywordId) || {};
+          return { ...k, ...perf };
+        });
+
+        return json(res, {
+          keywords: result,
+          perfStatus: cache.keywordPerf?.status || "idle",
+          count: result.length,
+        });
+      } catch (e) {
+        return json(res, { error: e.message }, 500);
+      }
+    }
+
+    // ── Update keyword bid ──
+    if (path === "/api/keywords/bid" && req.method === "PUT") {
+      const { keywordId, bid } = await readBody(req);
+      const { ok, data } = await amazon.updateKeyword(keywordId, bid);
+      logAction("keyword_bid", `Bid kw ${keywordId} → €${bid}`, { keywordId, bid }, ok);
+      if (ok) cache.keywords = null; // invalidate
+      return json(res, { ok, data });
+    }
+
+    // ── Pause keyword ──
+    if (path === "/api/keywords/pause" && req.method === "PUT") {
+      const { keywordId } = await readBody(req);
+      const { ok, data } = await amazon.pauseKeyword(keywordId);
+      logAction("keyword_pause", `Paused kw ${keywordId}`, { keywordId }, ok);
+      if (ok) cache.keywords = null;
+      return json(res, { ok, data });
+    }
+
+    // ── Add negative keyword ──
+    if (path === "/api/keywords/negative" && req.method === "POST") {
+      const { campaignId, adGroupId, keywordText, matchType } = await readBody(req);
+      const { ok, data } = await amazon.addNegativeKeyword(campaignId, adGroupId, keywordText, matchType);
+      logAction("negative_keyword", `Added negative "${keywordText}" (${matchType}) to ${campaignId}`, {}, ok);
+      return json(res, { ok, data });
+    }
+
+    // ── Search terms ──
+    if (path === "/api/search-terms") {
+      const start = params.get("start") || daysAgoStr(14);
+      const end   = params.get("end")   || today();
+      startReportFetch("searchTermPerf", () => amazon.getSearchTermPerformance(start, end));
+      const cached = getCachedReport("searchTermPerf");
+
+      if (cached.status !== "ready" || !cached.data) {
+        return json(res, { status: cached.status, data: [], message: "Report in elaborazione..." });
+      }
+
+      // Group by query
+      const map = {};
+      for (const r of cached.data) {
+        const q = r.query || r.keywordText;
+        if (!map[q]) map[q] = { query: q, campaignName: r.campaignName, matchType: r.matchType, spend:0, clicks:0, impressions:0, orders:0, sales:0 };
+        map[q].spend       += r.spend       || 0;
+        map[q].clicks      += r.clicks      || 0;
+        map[q].impressions += r.impressions || 0;
+        map[q].orders      += r.orders      || r.attributedConversions14d || 0;
+        map[q].sales       += r.sales7d     || r.attributedSales14d       || 0;
+      }
+      const terms = Object.values(map).map(t => ({
+        ...t,
+        acos: t.sales > 0 ? t.spend / t.sales : null,
+        ctr:  t.impressions > 0 ? t.clicks / t.impressions : null,
+      })).sort((a, b) => b.spend - a.spend);
+
+      return json(res, { status: "ready", data: terms, count: terms.length });
+    }
+
+    // ── AI recommendations ──
+    if (path === "/api/ai/recommendations") {
+      // Trigger report fetches if not started
+      const start14 = daysAgoStr(14);
+      startReportFetch("campaignPerf",  () => amazon.getCampaignPerformance(start14, today()));
+      startReportFetch("keywordPerf",   () => amazon.getKeywordPerformance(start14, today()));
+
+      return json(res, {
+        lastOptimization: cache.lastOptimization,
+        pendingActions,
+        optimizationRunning,
+        reportStatuses: {
+          campaignPerf:    getCachedReport("campaignPerf").status,
+          keywordPerf:     getCachedReport("keywordPerf").status,
+          searchTermPerf:  getCachedReport("searchTermPerf").status,
+        },
+        actionLog: actionLog.slice(0, 20),
+      });
+    }
+
+    // ── Apply pending action ──
+    if (path === "/api/ai/apply" && req.method === "POST") {
+      const { actionId } = await readBody(req);
+      const idx = pendingActions.findIndex(a => a.id === actionId);
+      if (idx === -1) return json(res, { error: "Action not found" }, 404);
+      const action = pendingActions.splice(idx, 1)[0];
+
+      try {
+        const results = await executeAutoActions([action], amazon);
+        for (const r of results) logAction(r.type, r.description, r.params, r.success);
+        return json(res, { ok: true, action, results });
+      } catch (e) {
+        return json(res, { ok: false, error: e.message }, 500);
+      }
+    }
+
+    // ── Dismiss pending action ──
+    if (path === "/api/ai/dismiss" && req.method === "POST") {
+      const { actionId } = await readBody(req);
+      const idx = pendingActions.findIndex(a => a.id === actionId);
+      if (idx !== -1) pendingActions.splice(idx, 1);
+      return json(res, { ok: true, remaining: pendingActions.length });
+    }
+
+    // ── Force-run AI ──
+    if (path === "/api/ai/run" && req.method === "POST") {
+      if (optimizationRunning) return json(res, { ok: false, message: "Already running" });
+      runOptimization(); // non-blocking
+      return json(res, { ok: true, message: "Optimization started" });
+    }
+
+    // ── Force refresh reports ──
+    if (path === "/api/reports/refresh" && req.method === "POST") {
+      const start14 = daysAgoStr(14);
+      const end0 = today();
+      // Reset cache entries to force new fetch
+      cache.campaignPerf   = null;
+      cache.keywordPerf    = null;
+      cache.searchTermPerf = null;
+      startReportFetch("campaignPerf",  () => amazon.getCampaignPerformance(start14, end0));
+      startReportFetch("keywordPerf",   () => amazon.getKeywordPerformance(start14, end0));
+      startReportFetch("searchTermPerf",() => amazon.getSearchTermPerformance(start14, end0));
+      return json(res, { ok: true, message: "Report refresh started — dati disponibili in 2-5 min" });
+    }
+
+    // ── Action log ──
+    if (path === "/api/log") {
+      return json(res, { log: actionLog.slice(0, 100) });
+    }
+
+    // ── Ad groups ──
+    if (path === "/api/adgroups") {
+      const campaignId = params.get("campaignId");
+      const { ok, data } = await amazon.getAdGroups(campaignId);
+      return json(res, ok ? (data.adGroups || data) : { error: data });
+    }
+
+    // ── 404 ──
+    return json(res, { error: "Not found", path }, 404);
+
   } catch (err) {
-    console.error(err);
-    json(res, { error: err.message }, 500);
+    console.error("Handler error:", err);
+    return json(res, { error: err.message }, 500);
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`API ready on :${PORT} | ACoS target ${(ACOS_TARGET*100).toFixed(0)}% | Budget max €${DAILY_BUDGET_MAX}`);
+  console.log(`
+🚀 XYZ Print Zone Ads API
+   Port     : ${PORT}
+   ACoS     : ${ACOS_TARGET*100}%
+   Budget   : €${BUDGET_MAX}/day
+   Source   : Amazon Advertising API v3 (REAL DATA)
+   AI       : GPT-4o auto-optimization every hour
+   Reports  : Background async (non-blocking)
+`);
 });
