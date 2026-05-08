@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amazon Ads — XYZ PRINT ZONE</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f1a;
+      --surface: #1a1a2e;
+      --card: #16213e;
+      --border: #2a2a4a;
+      --primary: #FF9900;
+      --success: #00c851;
+      --danger: #ff4444;
+      --warning: #ffbb33;
+      --info: #33b5e5;
+      --text: #ffffff;
+      --text2: #a0a0b8;
+      --text3: #606080;
+    }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; display: flex; flex-direction: column; }
+    /* Layout */
+    #app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+    #content { flex: 1; overflow-y: auto; }
+    /* Tabs */
+    #tabbar { display: flex; background: var(--surface); border-top: 1px solid var(--border); padding: 6px 0 10px; flex-shrink: 0; }
+    .tab { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; padding: 6px 0; border: none; background: none; color: var(--text3); font-size: 11px; transition: color 0.2s; }
+    .tab.active { color: var(--primary); }
+    .tab-icon { font-size: 22px; }
+    /* Screen */
+    .screen { display: none; padding: 16px; }
+    .screen.active { display: block; }
+    /* Card */
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+    /* Typography */
+    h1 { font-size: 26px; font-weight: 700; margin-bottom: 2px; }
+    h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+    h3 { font-size: 15px; font-weight: 600; }
+    .caption { font-size: 13px; color: var(--text2); }
+    .muted { color: var(--text3); }
+    /* Metrics grid */
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .metric { background: var(--surface); border-radius: 10px; padding: 10px 6px; text-align: center; }
+    .metric-value { font-size: 18px; font-weight: 700; margin-top: 4px; }
+    .metric-label { font-size: 11px; color: var(--text2); }
+    /* Buttons */
+    .btn { padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: var(--primary); color: #000; }
+    .btn-danger { background: rgba(255,68,68,0.15); color: var(--danger); }
+    .btn-success { background: rgba(0,200,81,0.15); color: var(--success); }
+    .btn-muted { background: var(--surface); color: var(--text2); }
+    .btn-full { width: 100%; padding: 13px; font-size: 15px; border-radius: 10px; }
+    /* Tags */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+    .badge-green { background: rgba(0,200,81,0.15); color: var(--success); }
+    .badge-red { background: rgba(255,68,68,0.15); color: var(--danger); }
+    .badge-yellow { background: rgba(255,187,51,0.15); color: var(--warning); }
+    /* Campaign card */
+    .campaign-card .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .campaign-card h3 { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .campaign-card .mini-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px; }
+    .campaign-card .mini-metric { text-align: center; }
+    .campaign-card .mini-metric .val { font-size: 14px; font-weight: 700; }
+    .campaign-card .mini-metric .lbl { font-size: 11px; color: var(--text3); }
+    .campaign-card .footer { display: flex; justify-content: space-between; font-size: 12px; color: var(--text3); margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+    /* Keyword card */
+    .kw-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
+    .kw-bid { text-align: right; }
+    .kw-bid .lbl { font-size: 11px; color: var(--text2); }
+    .kw-bid .val { font-size: 18px; font-weight: 700; color: var(--primary); }
+    .kw-actions { display: flex; gap: 8px; }
+    .kw-edit-row { display: flex; gap: 8px; align-items: center; }
+    .kw-edit-row input { flex: 1; background: var(--surface); border: 1px solid var(--primary); border-radius: 8px; color: var(--text); padding: 8px 12px; font-size: 14px; outline: none; }
+    /* Search terms */
+    .filters { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .filter-btn { padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 12px; cursor: pointer; }
+    .filter-btn.active { background: var(--primary); color: #000; border-color: var(--primary); }
+    .sort-row { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 12px; color: var(--text2); flex-wrap: wrap; }
+    .sort-btn { padding: 4px 8px; border-radius: 6px; border: none; background: none; color: var(--text2); font-size: 12px; cursor: pointer; }
+    .sort-btn.active { background: var(--surface); color: var(--primary); }
+    .term-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+    .term-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; text-align: center; margin-top: 8px; }
+    .term-metric .val { font-size: 14px; font-weight: 700; }
+    .term-metric .lbl { font-size: 11px; color: var(--text3); }
+    /* Settings */
+    .setting-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+    .setting-row:last-child { border-bottom: none; }
+    .setting-row .val { color: var(--primary); font-weight: 500; }
+    /* Header */
+    .screen-header { margin-bottom: 16px; }
+    .screen-header .sub { font-size: 13px; color: var(--text2); margin-top: 4px; }
+    /* Loading */
+    .spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-center { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 40px; }
+    /* Toast */
+    #toast { position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 10px 20px; border-radius: 10px; font-size: 14px; display: none; z-index: 100; white-space: nowrap; }
+    #toast.show { display: block; animation: fadein 0.2s; }
+    @keyframes fadein { from { opacity: 0; transform: translateX(-50%) translateY(10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+    /* Modal */
+    #modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 200; padding: 20px; }
+    #modal-overlay.show { display: flex; }
+    #modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; max-width: 340px; width: 100%; }
+    #modal h3 { margin-bottom: 8px; }
+    #modal p { font-size: 14px; color: var(--text2); margin-bottom: 16px; }
+    #modal .modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    /* Target card */
+    .targets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .target-item { text-align: center; }
+    .target-item .val { font-size: 15px; font-weight: 700; color: var(--primary); margin-top: 4px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="content">
+    <!-- Dashboard -->
+    <div id="screen-dashboard" class="screen active">
+      <div class="screen-header">
+        <h1>📊 Dashboard</h1>
+        <div class="sub">XYZ PRINT ZONE — IT</div>
+      </div>
+      <div class="card">
+        <h2>Oggi</h2>
+        <div class="metrics">
+          <div class="metric"><div class="metric-label">Spesa</div><div class="metric-value" id="m-spend" style="color:var(--danger)">—</div></div>
+          <div class="metric"><div class="metric-label">Vendite</div><div class="metric-value" id="m-sales" style="color:var(--success)">—</div></div>
+          <div class="metric"><div class="metric-label">ACoS</div><div class="metric-value" id="m-acos" style="color:var(--warning)">—</div></div>
+          <div class="metric"><div class="metric-label">Ordini</div><div class="metric-value" id="m-orders" style="color:var(--info)">—</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Target</h2>
+        <div class="targets">
+          <div class="target-item"><div class="caption">Scritta 3D</div><div class="val">ACoS 27%</div></div>
+          <div class="target-item"><div class="caption">Portachiavi</div><div class="val">ACoS 22%</div></div>
+          <div class="target-item"><div class="caption">Budget/g</div><div class="val">€30</div></div>
+        </div>
+      </div>
+      <h2 id="campaigns-title" style="margin-bottom:10px">Campagne</h2>
+      <div id="campaigns-list"><div class="loading-center"><div class="spinner"></div><div class="caption">Caricamento campagne...</div></div></div>
+    </div>
+
+    <!-- Keywords -->
+    <div id="screen-keywords" class="screen">
+      <div class="screen-header">
+        <h1>🎯 Keywords</h1>
+        <div class="sub" id="kw-count">—</div>
+      </div>
+      <div id="keywords-list"><div class="loading-center"><div class="spinner"></div></div></div>
+    </div>
+
+    <!-- Search Terms -->
+    <div id="screen-searchterms" class="screen">
+      <div class="screen-header">
+        <h1>🔍 Search Terms</h1>
+      </div>
+      <div id="st-idle" class="card">
+        <p style="font-size:14px;color:var(--text2);margin-bottom:12px">Richiedi il report search terms degli ultimi 30 giorni</p>
+        <button class="btn btn-primary btn-full" onclick="requestReport()">📊 Genera Report</button>
+      </div>
+      <div id="st-loading" style="display:none" class="loading-center"><div class="spinner"></div><div class="caption" id="st-status-msg">Richiesta in corso...</div></div>
+      <div id="st-results" style="display:none">
+        <div class="filters" id="st-filters">
+          <button class="filter-btn active" data-filter="all" onclick="setFilter(this,'all')">Tutti</button>
+          <button class="filter-btn" data-filter="high_acos" onclick="setFilter(this,'high_acos')">ACoS &gt; 30%</button>
+          <button class="filter-btn" data-filter="no_conv" onclick="setFilter(this,'no_conv')">0 conv (&gt;3 click)</button>
+        </div>
+        <div class="sort-row">
+          <span>Ordina:</span>
+          <button class="sort-btn active" data-sort="cost" onclick="setSort(this,'cost')">Spesa</button>
+          <button class="sort-btn" data-sort="clicks" onclick="setSort(this,'clicks')">Click</button>
+          <button class="sort-btn" data-sort="conversions" onclick="setSort(this,'conversions')">Conv</button>
+          <button class="sort-btn" data-sort="acos" onclick="setSort(this,'acos')">ACoS</button>
+        </div>
+        <div class="caption" id="st-count" style="margin-bottom:8px"></div>
+        <div id="st-list"></div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div id="screen-settings" class="screen">
+      <div class="screen-header"><h1>⚙️ Impostazioni</h1></div>
+      <h2 style="margin-bottom:8px">Target KPI</h2>
+      <div class="card">
+        <div class="setting-row"><span>Scritta 3D — ACoS target</span><span class="val">27%</span></div>
+        <div class="setting-row"><span>Portachiavi — ACoS target</span><span class="val">22%</span></div>
+        <div class="setting-row"><span>Budget giornaliero</span><span class="val">€30</span></div>
+        <div class="setting-row"><span>Ordini target/giorno</span><span class="val">10–15</span></div>
+      </div>
+      <h2 style="margin:16px 0 8px">Account</h2>
+      <div class="card">
+        <div class="setting-row"><span>Account</span><span style="color:var(--text)">XYZ PRINT ZONE</span></div>
+        <div class="setting-row"><span>Marketplace</span><span style="color:var(--text)">Amazon.it (IT)</span></div>
+        <div class="setting-row"><span>Profile ID</span><span style="color:var(--text3);font-size:12px">780286177334997</span></div>
+        <div class="setting-row"><span>Valuta</span><span style="color:var(--text)">EUR</span></div>
+        <div class="setting-row"><span>Timezone</span><span style="color:var(--text)">Europe/Paris</span></div>
+      </div>
+      <h2 style="margin:16px 0 8px">API</h2>
+      <div class="card">
+        <div class="setting-row"><span>Endpoint</span><span style="color:var(--text3);font-size:12px">advertising-api-eu.amazon.com</span></div>
+        <div class="setting-row"><span>Modalità</span><span id="api-mode" class="val">—</span></div>
+        <div class="setting-row"><span>Aggiornamento auto</span><span style="color:var(--text)">Ogni 2 minuti</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div id="tabbar">
+    <button class="tab active" onclick="showTab('dashboard',this)"><span class="tab-icon">📊</span><span>Dashboard</span></button>
+    <button class="tab" onclick="showTab('keywords',this)"><span class="tab-icon">🎯</span><span>Keywords</span></button>
+    <button class="tab" onclick="showTab('searchterms',this)"><span class="tab-icon">🔍</span><span>Search Terms</span></button>
+    <button class="tab" onclick="showTab('settings',this)"><span class="tab-icon">⚙️</span><span>Impostazioni</span></button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- Modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h3 id="modal-title"></h3>
+    <p id="modal-body"></p>
+    <div class="modal-btns">
+      <button class="btn btn-muted" id="modal-cancel" onclick="closeModal()">Annulla</button>
+      <button class="btn" id="modal-confirm">Conferma</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'https://amazon-ads-api.onrender.com';
+
+// ---- Helpers ----
+function fmt(n, pre='') { if(!n||isNaN(n)) return '—'; return pre+n.toFixed(2); }
+function acos(cost,sales) { if(!sales) return '—'; return ((cost/sales)*100).toFixed(1)+'%'; }
+function acosColor(v) { if(v===null||isNaN(v)) return 'var(--text3)'; if(v>30) return 'var(--danger)'; if(v>20) return 'var(--warning)'; return 'var(--success)'; }
+function toast(msg, dur=2500) {
+  const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), dur);
+}
+
+// ---- Modal ----
+let modalCb = null;
+function showModal(title, body, confirmLabel, confirmClass, cb) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').textContent = body;
+  const btn = document.getElementById('modal-confirm');
+  btn.textContent = confirmLabel;
+  btn.className = 'btn ' + confirmClass;
+  modalCb = cb;
+  btn.onclick = () => { closeModal(); cb(); };
+  document.getElementById('modal-overlay').classList.add('show');
+}
+function closeModal() { document.getElementById('modal-overlay').classList.remove('show'); }
+document.getElementById('modal-overlay').addEventListener('click', e => { if(e.target===e.currentTarget) closeModal(); });
+
+// ---- Tabs ----
+function showTab(name, btn) {
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('screen-'+name).classList.add('active');
+  btn.classList.add('active');
+  if(name==='keywords' && !kwLoaded) loadKeywords();
+}
+
+// ---- API ----
+async function apiFetch(path, opts={}) {
+  const r = await fetch(API+path, { headers:{'Content-Type':'application/json'}, ...opts });
+  const d = await r.json();
+  if(!r.ok) throw new Error(d?.error||'API error');
+  return d;
+}
+
+// ---- Dashboard ----
+let campaigns = [];
+async function loadDashboard() {
+  try {
+    campaigns = await apiFetch('/api/campaigns');
+    if(!Array.isArray(campaigns)) campaigns = [];
+    const spend = campaigns.reduce((s,c)=>s+(c.cost||0),0);
+    const sales = campaigns.reduce((s,c)=>s+(c.attributedSales14d||0),0);
+    const orders = campaigns.reduce((s,c)=>s+(c.attributedConversions14d||0),0);
+    document.getElementById('m-spend').textContent = '€'+fmt(spend);
+    document.getElementById('m-sales').textContent = '€'+fmt(sales);
+    document.getElementById('m-acos').textContent = acos(spend,sales);
+    document.getElementById('m-orders').textContent = Math.round(orders)||'—';
+    document.getElementById('campaigns-title').textContent = `Campagne (${campaigns.length})`;
+    document.getElementById('campaigns-list').innerHTML = campaigns.map(renderCampaign).join('');
+    document.getElementById('api-mode').textContent = 'Mock Data';
+  } catch(e) {
+    document.getElementById('campaigns-list').innerHTML = `<div class="card"><p style="color:var(--danger)">Errore: ${e.message}</p><button class="btn btn-muted" onclick="loadDashboard()">Riprova</button></div>`;
+  }
+}
+
+function renderCampaign(c) {
+  const spend = c.cost||0, sales = c.attributedSales14d||0;
+  const acosV = sales?(spend/sales)*100:null;
+  const isOn = c.state==='enabled';
+  return `<div class="card campaign-card">
+    <div class="top">
+      <h3>${escHtml(c.name)}</h3>
+      <button class="btn ${isOn?'badge-green':'badge-red'}" style="font-size:11px;padding:4px 10px" onclick="toggleCampaign(${c.campaignId},'${c.state}','${escHtml(c.name)}')">
+        ${isOn?'● ATTIVA':'⏸ PAUSA'}
+      </button>
+    </div>
+    <div class="mini-metrics">
+      <div class="mini-metric"><div class="val" style="color:var(--danger)">€${fmt(spend)}</div><div class="lbl">Spesa</div></div>
+      <div class="mini-metric"><div class="val" style="color:var(--success)">€${fmt(sales)}</div><div class="lbl">Vendite</div></div>
+      <div class="mini-metric"><div class="val" style="color:${acosColor(acosV)}">${acosV!==null?acosV.toFixed(1)+'%':'—'}</div><div class="lbl">ACoS</div></div>
+      <div class="mini-metric"><div class="val">${c.clicks||'—'}</div><div class="lbl">Click</div></div>
+    </div>
+    <div class="footer"><span>Budget: €${c.dailyBudget?(c.dailyBudget/100).toFixed(2):'—'}/g</span><span>Portfolio: ${c.portfolioId||'—'}</span></div>
+  </div>`;
+}
+
+function toggleCampaign(id, state, name) {
+  const newState = state==='enabled'?'paused':'enabled';
+  const action = newState==='paused'?'Metti in pausa':'Riattiva';
+  showModal(`${action} campagna`, `"${name}"`, action, newState==='paused'?'btn-danger':'btn-success', async()=>{
+    try {
+      await apiFetch('/api/campaigns',{method:'PUT',body:JSON.stringify({campaignId:id,updates:{state:newState}})});
+      toast(`Campagna ${newState==='paused'?'messa in pausa':'riattivata'}`);
+      loadDashboard();
+    } catch(e){ toast('Errore: '+e.message); }
+  });
+}
+
+// ---- Keywords ----
+let kwLoaded = false, keywords = [], editingKwId = null;
+async function loadKeywords() {
+  kwLoaded = true;
+  document.getElementById('keywords-list').innerHTML = `<div class="loading-center"><div class="spinner"></div></div>`;
+  try {
+    keywords = await apiFetch('/api/keywords');
+    if(!Array.isArray(keywords)) keywords = [];
+    document.getElementById('kw-count').textContent = keywords.length+' keyword';
+    renderKeywords();
+  } catch(e) {
+    document.getElementById('keywords-list').innerHTML = `<div class="card"><p style="color:var(--danger)">Errore: ${e.message}</p></div>`;
+  }
+}
+
+function renderKeywords() {
+  document.getElementById('keywords-list').innerHTML = keywords.length===0
+    ? '<div class="card"><p style="text-align:center;color:var(--text2)">Nessuna keyword</p></div>'
+    : keywords.map(renderKw).join('');
+}
+
+function renderKw(kw) {
+  const isEditing = editingKwId===kw.keywordId;
+  return `<div class="card" id="kw-${kw.keywordId}">
+    <div class="kw-top">
+      <div style="flex:1;overflow:hidden">
+        <div style="font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(kw.keywordText)}</div>
+        <div class="caption">${kw.matchType} · ${kw.state}</div>
+      </div>
+      <div class="kw-bid">
+        <div class="lbl">Bid attuale</div>
+        <div class="val">€${kw.bid?.toFixed(2)||'—'}</div>
+      </div>
+    </div>
+    ${isEditing ? `
+      <div class="kw-edit-row">
+        <input id="bid-input-${kw.keywordId}" type="number" step="0.01" min="0.02" placeholder="Nuovo bid €" value="${kw.bid||''}" />
+        <button class="btn btn-primary" onclick="confirmBidUpdate(${kw.keywordId},'${escHtml(kw.keywordText)}',${kw.bid})">Salva</button>
+        <button class="btn btn-muted" onclick="cancelEdit()">✕</button>
+      </div>` : `
+      <div class="kw-actions">
+        <button class="btn" style="background:rgba(255,153,0,0.15);color:var(--primary)" onclick="startEdit(${kw.keywordId})">✏️ Modifica bid</button>
+        ${kw.state==='enabled'?`<button class="btn btn-danger" onclick="pauseKw(${kw.keywordId},'${escHtml(kw.keywordText)}')">⏸ Pausa</button>`:''}
+      </div>`}
+  </div>`;
+}
+
+function startEdit(id) { editingKwId=id; renderKeywords(); setTimeout(()=>document.getElementById('bid-input-'+id)?.focus(),50); }
+function cancelEdit() { editingKwId=null; renderKeywords(); }
+
+function confirmBidUpdate(id, text, oldBid) {
+  const val = parseFloat(document.getElementById('bid-input-'+id)?.value);
+  if(isNaN(val)||val<=0){ toast('Bid non valido'); return; }
+  showModal('Aggiorna bid', `"${text}"\n€${oldBid} → €${val.toFixed(2)}`, 'Aggiorna', 'btn-primary', async()=>{
+    try {
+      await apiFetch('/api/keywords/bid',{method:'PUT',body:JSON.stringify({keywordId:id,bid:val})});
+      toast('Bid aggiornato ✓');
+      editingKwId=null; kwLoaded=false; loadKeywords();
+    } catch(e){ toast('Errore: '+e.message); }
+  });
+}
+
+function pauseKw(id, text) {
+  showModal('Metti in pausa keyword',`"${text}"`, 'Pausa', 'btn-danger', async()=>{
+    try {
+      await apiFetch('/api/keywords/pause',{method:'PUT',body:JSON.stringify({keywordId:id})});
+      toast('Keyword in pausa');
+      kwLoaded=false; loadKeywords();
+    } catch(e){ toast('Errore: '+e.message); }
+  });
+}
+
+// ---- Search Terms ----
+let stData=[], stFilter='all', stSort='cost';
+
+async function requestReport() {
+  document.getElementById('st-idle').style.display='none';
+  document.getElementById('st-loading').style.display='flex';
+  document.getElementById('st-status-msg').textContent='Richiesta in corso...';
+  try {
+    const r = await apiFetch('/api/report/request',{method:'POST'});
+    if(r?.reportId) { document.getElementById('st-status-msg').textContent='Elaborazione... (può richiedere 1-2 min)'; pollReport(r.reportId); }
+    else throw new Error('No reportId');
+  } catch(e) {
+    document.getElementById('st-loading').style.display='none';
+    document.getElementById('st-idle').style.display='block';
+    toast('Errore: '+e.message);
+  }
+}
+
+async function pollReport(reportId, attempts=0) {
+  if(attempts>20){ document.getElementById('st-loading').style.display='none'; document.getElementById('st-idle').style.display='block'; toast('Timeout report'); return; }
+  try {
+    const s = await apiFetch(`/api/report/${reportId}`);
+    if(s.status==='SUCCESS' && s.location) {
+      const rows = await apiFetch('/api/report/download',{method:'POST',body:JSON.stringify({url:s.location})});
+      stData = Array.isArray(rows)?rows:[];
+      document.getElementById('st-loading').style.display='none';
+      document.getElementById('st-results').style.display='block';
+      renderStResults();
+    } else if(s.status==='FAILURE') {
+      document.getElementById('st-loading').style.display='none'; document.getElementById('st-idle').style.display='block'; toast('Report fallito');
+    } else {
+      setTimeout(()=>pollReport(reportId,attempts+1),3000);
+    }
+  } catch(e){ setTimeout(()=>pollReport(reportId,attempts+1),3000); }
+}
+
+function setFilter(btn, f) {
+  stFilter=f;
+  document.querySelectorAll('#st-filters .filter-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderStResults();
+}
+
+function setSort(btn, s) {
+  stSort=s;
+  document.querySelectorAll('.sort-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderStResults();
+}
+
+function renderStResults() {
+  let rows = stData.filter(r=>{
+    if(stFilter==='high_acos'){ const a=r.attributedSales14d?r.cost/r.attributedSales14d:999; return a>0.3; }
+    if(stFilter==='no_conv') return r.attributedConversions14d===0 && r.clicks>3;
+    return true;
+  }).sort((a,b)=>{
+    if(stSort==='cost') return b.cost-a.cost;
+    if(stSort==='clicks') return b.clicks-a.clicks;
+    if(stSort==='conversions') return b.attributedConversions14d-a.attributedConversions14d;
+    if(stSort==='acos'){ const aa=a.attributedSales14d?a.cost/a.attributedSales14d:999, ab=b.attributedSales14d?b.cost/b.attributedSales14d:999; return ab-aa; }
+    return 0;
+  });
+  document.getElementById('st-count').textContent=rows.length+' termini';
+  document.getElementById('st-list').innerHTML=rows.map((r,i)=>{
+    const acosV=r.attributedSales14d?(r.cost/r.attributedSales14d)*100:null;
+    return `<div class="card">
+      <div class="term-top">
+        <div style="font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${escHtml(r.query)}</div>
+        <button class="btn btn-danger" style="font-size:12px;padding:4px 10px;flex-shrink:0;margin-left:8px" onclick="addNegative('${escHtml(r.query)}')">− Negativa</button>
+      </div>
+      <div class="caption" style="margin-bottom:6px">Keyword: ${escHtml(r.keywordText)} · ${escHtml(r.campaignName)}</div>
+      <div class="term-metrics">
+        <div class="term-metric"><div class="val" style="color:var(--danger)">€${r.cost?.toFixed(2)}</div><div class="lbl">Spesa</div></div>
+        <div class="term-metric"><div class="val">${r.clicks}</div><div class="lbl">Click</div></div>
+        <div class="term-metric"><div class="val" style="color:${r.attributedConversions14d>0?'var(--success)':'var(--text2)'}">${r.attributedConversions14d}</div><div class="lbl">Conv</div></div>
+        <div class="term-metric"><div class="val" style="color:${acosColor(acosV)}">${acosV!==null?acosV.toFixed(1)+'%':'—'}</div><div class="lbl">ACoS</div></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function addNegative(query) {
+  showModal('Aggiungi keyword negativa', `"${query}" come negativa esatta?`, 'Aggiungi', 'btn-danger', async()=>{
+    try {
+      await apiFetch('/api/keywords/negative',{method:'POST',body:JSON.stringify({campaignId:0,adGroupId:0,keywordText:query})});
+      toast('Negativa aggiunta ✓');
+    } catch(e){ toast('Errore: '+e.message); }
+  });
+}
+
+// ---- Utils ----
+function escHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ---- Init ----
+loadDashboard();
+setInterval(loadDashboard, 120000);
+</script>
+</body>
+</html>
