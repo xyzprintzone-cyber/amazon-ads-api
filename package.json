@@ -1,0 +1,14 @@
+{
+  "name": "amazon-ads-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}

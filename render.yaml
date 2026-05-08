@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: amazon-ads-api
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: USE_MOCK
+        value: "true"
+      - key: AMAZON_CLIENT_ID
+        sync: false
+      - key: AMAZON_CLIENT_SECRET
+        sync: false
+      - key: AMAZON_REFRESH_TOKEN
+        sync: false
+      - key: AMAZON_PROFILE_ID
+        sync: false
